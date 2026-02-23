@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import uuid
+import hashlib
 from datetime import datetime
 
 from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, UploadFile, File
@@ -8,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 
 from .db import init_db, get_session
-from .models import Robot, ChatMessage, CompetitionAnalysis, AuthorityEdit, AuthorityAgentRun
+from .models import Robot, ChatMessage, CompetitionAnalysis, AuthorityEdit, AuthorityAgentRun, BusinessCore
 from .schemas import (
     BriefingIn,
     RobotOut,
@@ -27,7 +28,7 @@ from .schemas import (
     CompetitionAnalyzeRequest,
     CompetitionJobV2Out,
     CompetitionReportV2Out,
-    CompetitionFindOut, # Adicionado import faltante
+    CompetitionFindOut,
 )
 from .ai import build_robot_from_briefing, chat_with_robot, transcribe_audio, find_competitors, build_competition_result, authority_assistant, run_authority_agent
 
@@ -138,6 +139,39 @@ def update_robot(public_id: str, body: RobotUpdateIn, session: Session = Depends
         created_at=robot.created_at.isoformat(),
     )
 
+# --- BUSINESS CORE ROUTES ---
+@app.get("/api/robots/{public_id}/business-core")
+def get_business_core(public_id: str, session: Session = Depends(get_session)):
+    robot = _get_robot_or_404(public_id, session)
+    core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
+    
+    if not core:
+        core = BusinessCore(robot_id=robot.id)
+        session.add(core)
+        session.commit()
+        session.refresh(core)
+        
+    return core
+
+@app.patch("/api/robots/{public_id}/business-core")
+def update_business_core(public_id: str, payload: dict, session: Session = Depends(get_session)):
+    robot = _get_robot_or_404(public_id, session)
+    core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
+    
+    if not core:
+        core = BusinessCore(robot_id=robot.id)
+        session.add(core)
+        
+    for k, v in payload.items():
+        if hasattr(core, k) and v is not None and k not in ("id", "robot_id"):
+            setattr(core, k, v)
+            
+    core.updated_at = datetime.utcnow()
+    session.add(core)
+    session.commit()
+    session.refresh(core)
+    return core
+
 # --- MESSAGES ROUTES ---
 @app.get("/api/robots/{public_id}/messages", response_model=list[ChatMessageOut])
 def list_messages(public_id: str, session: Session = Depends(get_session)):
@@ -156,7 +190,6 @@ def list_messages(public_id: str, session: Session = Depends(get_session)):
 def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, session: Session = Depends(get_session)):
     robot = _get_robot_or_404(public_id, session)
 
-    # Fetch recent authority edits to avoid repeating the same updates
     edits = session.exec(
         select(AuthorityEdit)
         .where(AuthorityEdit.robot_id == robot.id)
@@ -181,7 +214,7 @@ def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, sessio
         )
 
     before_instructions = robot.system_instructions or ""
-    before_hash = __import__("hashlib").sha256(before_instructions.encode("utf-8")).hexdigest()
+    before_hash = hashlib.sha256(before_instructions.encode("utf-8")).hexdigest()
 
     result = authority_assistant(
         robot_system_instructions=before_instructions,
@@ -192,9 +225,8 @@ def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, sessio
 
     if result.get("apply_change") and result.get("updated_system_instructions"):
         updated = str(result["updated_system_instructions"])
-        after_hash = __import__("hashlib").sha256(updated.encode("utf-8")).hexdigest()
+        after_hash = hashlib.sha256(updated.encode("utf-8")).hexdigest()
 
-        # Dedupe: if we already have this exact after state, don't store again
         exists = session.exec(
             select(AuthorityEdit).where(
                 AuthorityEdit.robot_id == robot.id,
@@ -211,7 +243,6 @@ def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, sessio
             changes_made = result.get("changes_made") or []
             summary = ""
             if isinstance(changes_made, list) and changes_made:
-                # short summary for neuroplasticity
                 summary = "; ".join(
                     [str(c.get("title") or c.get("change") or c.get("what") or "").strip() for c in changes_made]
                 )[:280]
@@ -230,7 +261,6 @@ def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, sessio
             session.add(edit)
             session.commit()
 
-    # Always return a valid response (FastAPI validates against response_model)
     return AuthorityAssistantOut(
         apply_change=bool(result.get("apply_change") or False),
         before_score=int(result.get("before_score") or 0),
@@ -242,8 +272,6 @@ def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, sessio
         assistant_reply=str(result.get("assistant_reply") or ""),
     )
 
-
-    
 @app.get("/api/robots/{public_id}/authority-edits", response_model=list[AuthorityEditOut])
 def list_authority_edits(public_id: str, session: Session = Depends(get_session)):
     robot = _get_robot_or_404(public_id, session)
@@ -270,7 +298,6 @@ def list_authority_edits(public_id: str, session: Session = Depends(get_session)
             )
         )
     return out
-
 
 @app.delete("/api/robots/{public_id}/messages")
 def clear_messages(public_id: str, session: Session = Depends(get_session)):
@@ -385,46 +412,42 @@ def _domain(url: str) -> str:
         return url
 
 def _run_analysis_job(public_id: str):
-    from .db import get_session as _get_s
-    gen = _get_s()
-    session = next(gen)
-    obj = None
-    try:
-        obj = session.exec(select(CompetitionAnalysis).where(CompetitionAnalysis.public_id == public_id)).first()
-        if not obj:
-            return
-        
-        _update_analysis(session, obj, status="running", stage="Coletando sinais públicos", progress=0.15)
-        
-        # Parse inputs
-        instagrams = json.loads(obj.instagrams_json or "[]")
-        sites = json.loads(obj.sites_json or "[]")
-        company = json.loads(obj.company_json or "{}") if obj.company_json else {}
+    from sqlmodel import Session
+    from .db import engine
+    import json
+    from .ai import build_competition_result
+    
+    with Session(engine) as session:
+        obj = None
+        try:
+            obj = session.exec(select(CompetitionAnalysis).where(CompetitionAnalysis.public_id == public_id)).first()
+            if not obj:
+                return
+            
+            _update_analysis(session, obj, status="running", stage="Coletando sinais públicos", progress=0.15)
+            
+            instagrams = json.loads(obj.instagrams_json or "[]")
+            sites = json.loads(obj.sites_json or "[]")
+            company = json.loads(obj.company_json or "{}") if obj.company_json else {}
 
-        competitors = []
-        for s in sites:
-            competitors.append({"name": _domain(s), "website_url": s})
-        
-        # Simulação de progresso real
-        _update_analysis(session, obj, stage="Analisando presença digital", progress=0.40)
-        
-        # ... lógica de instagram aqui ...
+            competitors = []
+            for s in sites:
+                competitors.append({"name": _domain(s), "website_url": s})
+            
+            _update_analysis(session, obj, stage="Analisando presença digital", progress=0.40)
+            
+            _update_analysis(session, obj, stage="Consolidando inteligência", progress=0.75)
 
-        _update_analysis(session, obj, stage="Consolidando inteligência", progress=0.75)
+            result = build_competition_result(company=company, competitors=competitors[:3])
 
-        result = build_competition_result(company=company, competitors=competitors[:3])
+            _update_analysis(session, obj, status="done", stage="Concluído", progress=1.0, result_json=json.dumps(result, ensure_ascii=False))
 
-        _update_analysis(session, obj, status="done", stage="Concluído", progress=1.0, result_json=json.dumps(result, ensure_ascii=False))
-
-    except Exception as e:
-        if obj:
-            _update_analysis(session, obj, status="error", stage="Erro no processamento", progress=1.0, error=str(e))
-        print(f"Job Error: {e}")
-    finally:
-        session.close()
+        except Exception as e:
+            if obj:
+                _update_analysis(session, obj, status="error", stage="Erro no processamento", progress=1.0, error=str(e))
+            print(f"Job Error: {e}")
 
 # --- COMPETITION ROUTES (V2 ONLY) ---
-
 @app.post("/api/competition/find-competitors", response_model=CompetitionFindOut)
 def competition_find_competitors_v2(payload: CompetitionFindRequest):
     briefing = payload.briefing.model_dump()
@@ -436,7 +459,6 @@ def competition_find_competitors_v2(payload: CompetitionFindRequest):
         "audience": briefing.get("publico_alvo"),
         "offer": briefing.get("servicos"),
     }
-    # Aqui assume-se que find_competitors retorna estrutura compatível com CompetitionFindOut
     data = find_competitors(mapped)
     return data
 
@@ -505,7 +527,6 @@ def competition_report_v2(report_id: str, session: Session = Depends(get_session
     return CompetitionReportV2Out(report_id=obj.public_id, status=obj.status, result=result)
 
 def _normalize_nucleus(nucleus: dict) -> dict:
-    # Preenche campos vazios com "não informado"
     def norm(v):
         if v is None:
             return "não informado"
@@ -522,7 +543,6 @@ def _normalize_nucleus(nucleus: dict) -> dict:
         else:
             out[k] = norm(v)
     return out
-
 
 def _cooldown_check(session: Session, client_id: str, agent_key: str, cooldown_seconds: int = 3600):
     last = session.exec(
@@ -542,7 +562,6 @@ def _cooldown_check(session: Session, client_id: str, agent_key: str, cooldown_s
             detail={"message": "Cooldown ativo para este agente.", "retry_after_seconds": retry_after},
             headers={"Retry-After": str(retry_after)},
         )
-
 
 @app.get("/api/authority-agents/history", response_model=AuthorityAgentHistoryOut)
 def authority_agents_history(client_id: str, session: Session = Depends(get_session)):
@@ -565,16 +584,12 @@ def authority_agents_history(client_id: str, session: Session = Depends(get_sess
         ]
     }
 
-
-
-
 @app.get("/api/authority-agents/run/{run_id}", response_model=AuthorityAgentRunOut)
 def authority_agents_get_run(run_id: int, client_id: str, session: Session = Depends(get_session)):
     run = session.get(AuthorityAgentRun, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Execução não encontrada.")
     if run.client_id != client_id:
-        # evita vazamento de dados entre navegadores/usuários
         raise HTTPException(status_code=403, detail="Acesso negado para esta execução.")
     return {
         "id": run.id,
@@ -612,8 +627,10 @@ def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depend
         "created_at": run.created_at.isoformat(),
     }
 
-
-# Backward-compat: se o front antigo ainda bater em /api/robots/{public_id}/authority-agents/run
 @app.post("/api/robots/{public_id}/authority-agents/run", response_model=AuthorityAgentRunOut)
 def authority_agents_run_compat(public_id: str, payload: AuthorityAgentRunIn, session: Session = Depends(get_session)):
     return authority_agents_run(payload, session)
+
+@app.get("/api/robots/{public_id}/authority-agents/cooldown")
+def authority_agents_cooldown(public_id: str, agent_key: str, client_id: str = "", session: Session = Depends(get_session)):
+    return {"cooldown_seconds": 0}

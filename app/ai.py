@@ -15,7 +15,7 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def _require_key():
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY não configurada. Edite backend/.env")
+        raise RuntimeError("OPENAI_API_KEY não configurada. Edite o seu .env com uma chave válida.")
 
 def build_robot_from_briefing(briefing: Dict[str, Any]) -> Dict[str, str]:
     _require_key()
@@ -29,16 +29,20 @@ def build_robot_from_briefing(briefing: Dict[str, Any]) -> Dict[str, str]:
         },
     }
 
-    resp = client.responses.create(
+    resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        instructions=BUILDER_SYSTEM + "\n\n" + GLOBAL_AIO_AEO_GEO,
-        input=[{"role": "user", "content": json.dumps(prompt_user, ensure_ascii=False)}],
+        messages=[
+            {"role": "system", "content": BUILDER_SYSTEM + "\n\n" + GLOBAL_AIO_AEO_GEO},
+            {"role": "user", "content": json.dumps(prompt_user, ensure_ascii=False)}
+        ],
         temperature=0.4,
-        max_output_tokens=900,
+        max_tokens=900,
+        response_format={"type": "json_object"} # Garante que a OpenAI devolva JSON puro
     )
 
-    text = (resp.output_text or "").strip()
-    # tolerate fenced json
+    text = (resp.choices[0].message.content or "").strip()
+    
+    # tolerate fenced json caso o modelo ainda teime em mandar markdown
     if text.startswith("```"):
         text = text.strip("`")
         text = text.replace("json", "", 1).strip()
@@ -46,6 +50,7 @@ def build_robot_from_briefing(briefing: Dict[str, Any]) -> Dict[str, str]:
     data = json.loads(text)
     title = str(data.get("title", "")).strip() or f"Robô {briefing.get('nicho','')}".strip() or "Robô"
     system_instructions = str(data.get("system_instructions", "")).strip()
+    
     if not system_instructions:
         raise RuntimeError("O construtor não retornou system_instructions.")
 
@@ -83,6 +88,8 @@ def _filter_domains(results: list[dict], allowed_domains: list[str] | None) -> l
         if host and any(host == d or host.endswith("."+d) for d in allowed):
             out.append(r)
     return out
+
+
 def chat_with_robot(
     system_instructions: str,
     history: List[Dict[str, str]],
@@ -108,15 +115,15 @@ def chat_with_robot(
         input_msgs = input_msgs + [{"role": "user", "content": web_block}]
     input_msgs = input_msgs + [{"role": "user", "content": user_message}]
 
-    resp = client.responses.create(
+    sys_msg = system_instructions + "\n\nSe usar FONTES DA WEB, cite no texto com [n] (ex: [1]) e não invente links."
+
+    resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        instructions=system_instructions
-        + "\n\nSe usar FONTES DA WEB, cite no texto com [n] (ex: [1]) e não invente links.",
-        input=input_msgs,
+        messages=[{"role": "system", "content": sys_msg}] + input_msgs,
         temperature=0.6,
-        max_output_tokens=1200,
+        max_tokens=1200,
     )
-    return (resp.output_text or "").strip()
+    return (resp.choices[0].message.content or "").strip()
 
 
 def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> str:
@@ -124,40 +131,37 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> str:
     _require_key()
     if not audio_bytes:
         raise RuntimeError("Áudio vazio.")
-    f = io.BytesIO(audio_bytes)
-    # OpenAI SDK lê o atributo 'name' para inferir extensão
-    f.name = filename  # type: ignore[attr-defined]
+    
     try:
         resp = client.audio.transcriptions.create(
             model=OPENAI_TRANSCRIBE_MODEL,
-            file=f,
+            file=(filename, audio_bytes, "audio/webm"),
             language="pt",
         )
     except Exception as e:
         # fallback clássico
         if OPENAI_TRANSCRIBE_MODEL != "whisper-1":
             try:
-                f2 = io.BytesIO(audio_bytes)
-                f2.name = filename  # type: ignore[attr-defined]
                 resp = client.audio.transcriptions.create(
                     model="whisper-1",
-                    file=f2,
+                    file=(filename, audio_bytes, "audio/webm"),
                     language="pt",
                 )
             except Exception:
                 raise
         else:
             raise
-    # SDK pode devolver objeto com .text ou string
+    
     text = getattr(resp, "text", None)
     if text is None and isinstance(resp, dict):
         text = resp.get("text")
     return (text or "").strip()
 
+
 def _serper_search(query: str, max_results: int = 10) -> list[dict]:
     if not SERPER_API_KEY:
         return []
-    url = "https://google.serper.dev/search"
+    url = "[https://google.serper.dev/search](https://google.serper.dev/search)"
     payload = {
         "q": query,
         "gl": SERPER_GL or "br",
@@ -167,8 +171,8 @@ def _serper_search(query: str, max_results: int = 10) -> list[dict]:
     }
     headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
     try:
-        with httpx.Client(timeout=20.0) as client:
-            r = client.post(url, headers=headers, json=payload)
+        with httpx.Client(timeout=20.0) as client_http:
+            r = client_http.post(url, headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()
     except Exception:
@@ -186,8 +190,8 @@ def _serper_search(query: str, max_results: int = 10) -> list[dict]:
         })
     return out
 
+
 def find_competitors(profile: dict) -> dict:
-    # aceita inglês e pt
     niche = str(profile.get("niche") or profile.get("segmento") or "").strip()
     region = str(profile.get("region") or profile.get("cidade_estado") or "").strip()
     services = str(profile.get("services") or profile.get("servicos") or profile.get("offer") or "").strip()
@@ -227,7 +231,6 @@ def find_competitors(profile: dict) -> dict:
             "data_quality": "incomplete",
         }
 
-    # Usa IA para selecionar até 3 concorrentes reais a partir das fontes
     prompt_input = {
         "profile": {"niche": niche, "region": region, "services": services, "audience": audience},
         "sources": sources[:12],
@@ -249,7 +252,6 @@ def find_competitors(profile: dict) -> dict:
 
     suggestions = data.get("suggestions") if isinstance(data, dict) else None
     if not isinstance(suggestions, list):
-        # fallback determinístico: pega top 3 domínios
         suggestions = []
         for s in sources:
             suggestions.append({
@@ -264,8 +266,8 @@ def find_competitors(profile: dict) -> dict:
 
     return {"suggestions": suggestions[:3], "sources": sources[:8], "note": "Sugestões geradas via busca (Serper).", "data_quality":"ok"}
 
+
 def build_competition_result(company: dict, competitors: list[dict]) -> dict:
-    # Saída JSON fixa para UI (sem markdown)
     payload = {"company": company, "competitors": competitors}
     try:
         if OPENAI_API_KEY:
@@ -280,7 +282,6 @@ def build_competition_result(company: dict, competitors: list[dict]) -> dict:
     except Exception:
         pass
 
-    # fallback simples determinístico
     def mk_signals():
         return {
             "presence": 50,
@@ -330,7 +331,7 @@ def authority_assistant(
 ) -> Dict[str, Any]:
     _require_key()
     history = history or []
-    # Keep only roles we understand
+    
     clean_hist = []
     for m in history[-20:]:
         role = str(m.get("role", "")).strip().lower()
@@ -345,18 +346,21 @@ def authority_assistant(
         "user_message": user_message,
     }
 
-    resp = client.responses.create(
+    resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        instructions=AUTHORITY_ASSISTANT_SYSTEM,
-        input=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+        messages=[
+            {"role": "system", "content": AUTHORITY_ASSISTANT_SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+        ],
+        response_format={"type": "json_object"}
     )
-    text = (resp.output_text or "").strip()
+    
+    text = (resp.choices[0].message.content or "").strip()
     if text.startswith("```"):
         text = text.strip("`")
         text = text.replace("json", "", 1).strip()
     data = json.loads(text)
 
-    # Normalize
     apply_change = bool(data.get("apply_change", False))
     updated = data.get("updated_system_instructions", None)
     if not apply_change:
@@ -419,6 +423,8 @@ AUTHORITY_AGENTS = {
         "instructions": "1) Missão do agente Você é um Agente de Preparação para Menções e Citações Externas. Seu papel é: Preparar a empresa para: Ser citada corretamente. Ser entendida como a mesma entidade em qualquer site ou mídia. Criar: Kit de menção pronto. Textos base reutilizáveis. Checklist de padronização de nome, serviço e links. Garantir: Consistência de identidade. Clareza semântica. Redução de erros de citação. Regra central: Este agente não promete publicação. Ele prepara a empresa para quando a menção acontecer. 2) Papel estratégico na Authority Architecture Este agente: Sustenta: AEO, porque fontes citadas precisam ser claras. AIO, porque IA consolida entidades por sinais consistentes. GEO, porque menções locais reforçam autoridade geográfica. Reduz: Erros de nome. Links quebrados. Citações ambíguas. Aumenta: Qualidade das menções. Chance de atribuição correta. Reconhecimento da entidade da marca por IA e buscadores. 3) Dados de entrada obrigatórios O agente deve pedir: Nome oficial da empresa. Variações usadas hoje, se existirem. Serviço principal. Serviços secundários. Cidade e região. Site principal. Páginas prioritárias para link (serviços, sobre, contato). Descrição curta oficial da empresa. Descrição longa oficial da empresa. Tom de comunicação desejado. Regras: Não inventar dados. Se algo não for fornecido, marcar como “a definir”. Trabalhar com preparação, não com promessa de divulgação. 4) O que o agente deve entregar 4.1 Preparação dos ativos de menção (Kit de menção) O agente deve montar um Kit de Menção, contendo: Nome oficial padronizado da empresa. Descrição curta oficial (1 a 2 linhas). Descrição média oficial (3 a 5 linhas). Descrição longa institucional (1 parágrafo). Lista de serviços principais em formato citável. Cidade e região de atuação em formato padrão. Links oficiais: Site principal. Página de serviços. Página sobre ou institucional. Perfil de Empresa no Google, se houver. Orientação de uso: Como a empresa deve ser citada. Como não deve ser citada. Objetivo: Qualquer jornalista, parceiro, portal ou IA consegue copiar e colar e citar corretamente. 4.2 Textos prontos para uso quando houver oportunidade O agente deve gerar modelos de texto, por exemplo: Mini apresentação para imprensa ou parceiros. Parágrafo padrão de citação institucional. Descrição curta para rodapé de matéria ou post. Texto de resposta quando alguém pede “nos envie uma descrição da empresa”. Texto para assinatura institucional em releases, artigos ou colaborações. Regras: Neutros. Informativos. Sem marketing exagerado. Focados em clareza de entidade. 4.3 Checklist de padronização de nome, serviço e links O agente deve entregar um checklist para garantir: Nome usado sempre igual. Serviço principal descrito sempre da mesma forma. Cidade/região citada sempre no mesmo padrão. Links sempre apontando para: URLs oficiais. Sem variações desnecessárias. Bio e descrições coerentes com: Site. Perfil de Empresa no Google. Redes sociais. 5) Estrutura padrão da entrega O agente deve sempre responder assim: Bloco 1. Objetivo do Kit de Menção Para que serve. O que ele resolve. Como isso ajuda: AEO. AIO. GEO. Reforço: Não promete publicação. Prepara a empresa para ser citada corretamente. Bloco 2. Kit de Menção (Pronto para Uso) Separado por seções: Nome oficial da empresa. Descrição curta. Descrição média. Descrição longa. Lista de serviços. Cidade e região. Links oficiais. Orientação de uso e de não uso. Tudo em formato copiar e colar. Bloco 3. Modelos de Texto para Menções Modelo de mini apresentação. Modelo de parágrafo institucional. Modelo de descrição curta para citação. Modelo de resposta para pedidos de descrição. Modelo de assinatura institucional. Bloco 4. Checklist de Consistência Checklist prático, por exemplo: Definir nome oficial único da empresa. Definir descrição curta, média e longa oficiais. Definir lista oficial de serviços. Definir formato padrão de cidade/região. Definir URLs oficiais para citação. Atualizar: Site. Perfil de Empresa no Google. Instagram. LinkedIn. YouTube. TikTok. Conferir se: Não existem variações de nome. Não existem links diferentes para a mesma página. Revisar o kit de menção a cada 90 dias. 6) Regras de qualidade do agente Antes de finalizar, o agente deve checar: Um terceiro consegue citar essa empresa corretamente só com esse kit? Uma IA conseguiria entender claramente: Quem é a empresa? O que ela faz? Onde atua? Não existe: Linguagem promocional exagerada. Promessa de resultado. Texto vago ou genérico. Está claro que isso é preparação, não promessa de publicação? Se algo estiver fraco: Refinar automaticamente",
     },
 }
+
+
 def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
     _require_key()
     agent = AUTHORITY_AGENTS.get(agent_key)
@@ -448,11 +454,13 @@ def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
         },
     }
 
-    resp = client.responses.create(
+    resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        instructions=instructions,
-        input=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+        ],
         temperature=0.5,
-        max_output_tokens=12000,
+        max_tokens=4000,
     )
-    return (getattr(resp, "output_text", None) or "").strip()
+    return (resp.choices[0].message.content or "").strip()

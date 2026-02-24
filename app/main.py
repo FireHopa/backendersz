@@ -3,6 +3,7 @@ import json
 import uuid
 import hashlib
 import io
+import re
 try:
     import pypdf
 except ImportError:
@@ -43,6 +44,7 @@ from .schemas import (
 from .ai import build_robot_from_briefing, chat_with_robot, transcribe_audio, find_competitors, build_competition_result, authority_assistant, run_authority_agent
 
 app = FastAPI(title="Authority Robot Panel API")
+
 async def extract_text_from_file(file: UploadFile) -> str:
     """Extrai texto de PDFs, DOCX ou arquivos de texto puro."""
     content = await file.read()
@@ -80,7 +82,7 @@ async def extract_text_from_file(file: UploadFile) -> str:
         raise HTTPException(status_code=400, detail="Formato não suportado. Use PDF, DOCX, TXT ou MD.")
 
     return text.strip()
-# FERA MODE: CORS Permissivo para dev. Em prod, restrinja.
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -100,14 +102,31 @@ def health():
 # --- ROBOT HELPERS ---
 def _get_robot_or_404(public_id: str, session: Session) -> Robot:
     robot = session.exec(select(Robot).where(Robot.public_id == public_id)).first()
+    
     if not robot:
+        if public_id == "business-core-global":
+            robot = Robot(
+                public_id="business-core-global",
+                title="[SISTEMA] Núcleo Global",
+                description="Armazena os arquivos do Núcleo da Empresa.",
+                system_instructions="Não usado diretamente no chat."
+            )
+            session.add(robot)
+            session.commit()
+            session.refresh(robot)
+            return robot
+            
         raise HTTPException(status_code=404, detail="Assistente não encontrado")
     return robot
 
 # --- ROBOT ROUTES ---
 @app.get("/api/robots", response_model=list[RobotOut])
 def list_robots(session: Session = Depends(get_session)):
-    robots = session.exec(select(Robot).order_by(Robot.created_at.desc())).all()
+    robots = session.exec(
+        select(Robot)
+        .where(Robot.public_id != "business-core-global")
+        .order_by(Robot.created_at.desc())
+    ).all()
     return [
         RobotOut(
             public_id=r.public_id,
@@ -651,6 +670,12 @@ def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depend
     nucleus = _normalize_nucleus(payload.nucleus)
     _cooldown_check(session, payload.client_id, payload.agent_key)
 
+    global_robot = session.exec(select(Robot).where(Robot.public_id == "business-core-global")).first()
+    if global_robot:
+        core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == global_robot.id)).first()
+        if core and getattr(core, "knowledge_text", None):
+            nucleus["conhecimento_anexado"] = core.knowledge_text
+
     try:
         output = run_authority_agent(payload.agent_key, nucleus)
     except ValueError as e:
@@ -689,18 +714,15 @@ async def upload_robot_knowledge(
     file: UploadFile = File(...), 
     session: Session = Depends(get_session)
 ):
-    """Sobe um arquivo de instrução exclusivo para um robô específico."""
     robot = _get_robot_or_404(public_id, session)
     
     text = await extract_text_from_file(file)
     if not text:
         raise HTTPException(status_code=400, detail="Arquivo vazio ou sem texto legível.")
         
-    # Anexa o conteúdo como uma instrução permanente de contexto
     separator = f"\n\n=== CONTEÚDO DO ARQUIVO: {file.filename} ===\n"
     robot.system_instructions += f"{separator}{text}"
     
-    # Registra no log de arquivos enviados
     try:
         files_list = json.loads(robot.knowledge_files_json or "[]")
     except:
@@ -723,13 +745,33 @@ async def upload_robot_knowledge(
         knowledge_files_json=robot.knowledge_files_json
     )
 
+@app.delete("/api/robots/{public_id}/knowledge-files/{filename}")
+def delete_robot_file(public_id: str, filename: str, session: Session = Depends(get_session)):
+    """Deleta um arquivo de conhecimento do robô."""
+    robot = _get_robot_or_404(public_id, session)
+    try:
+        files_list = json.loads(robot.knowledge_files_json or "[]")
+    except:
+        files_list = []
+        
+    new_list = [f for f in files_list if f.get("filename") != filename]
+    robot.knowledge_files_json = json.dumps(new_list, ensure_ascii=False)
+    
+    # Remove do texto mestre
+    if robot.system_instructions:
+        pattern = rf"\n\n=== CONTEÚDO DO ARQUIVO: {re.escape(filename)} ===\n.*?(?=\n\n=== CONTEÚDO DO ARQUIVO:|$)"
+        robot.system_instructions = re.sub(pattern, "", robot.system_instructions, flags=re.DOTALL)
+        
+    session.add(robot)
+    session.commit()
+    return {"ok": True}
+
 @app.post("/api/robots/{public_id}/business-core/upload-knowledge")
 async def upload_business_core_knowledge(
     public_id: str, 
     file: UploadFile = File(...), 
     session: Session = Depends(get_session)
 ):
-    """Sobe um arquivo com conhecimento base da Empresa."""
     robot = _get_robot_or_404(public_id, session)
     core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
     
@@ -741,7 +783,7 @@ async def upload_business_core_knowledge(
     if not text:
         raise HTTPException(status_code=400, detail="Arquivo vazio ou sem texto.")
         
-    current_knowledge = core.knowledge_text or ""
+    current_knowledge = getattr(core, 'knowledge_text', '') or ""
     separator = f"\n\n=== MATERIAIS DE APOIO: {file.filename} ===\n"
     core.knowledge_text = f"{current_knowledge}{separator}{text}"
     
@@ -759,3 +801,28 @@ async def upload_business_core_knowledge(
     session.refresh(core)
     
     return core
+
+@app.delete("/api/robots/{public_id}/business-core/files/{filename}")
+def delete_business_core_file(public_id: str, filename: str, session: Session = Depends(get_session)):
+    """Deleta um arquivo de conhecimento do Núcleo."""
+    robot = _get_robot_or_404(public_id, session)
+    core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
+    
+    if not core:
+        raise HTTPException(status_code=404, detail="Núcleo não encontrado")
+        
+    try:
+        files_list = json.loads(core.knowledge_files_json or "[]")
+    except:
+        files_list = []
+        
+    new_list = [f for f in files_list if f.get("filename") != filename]
+    core.knowledge_files_json = json.dumps(new_list, ensure_ascii=False)
+    
+    if getattr(core, 'knowledge_text', None):
+        pattern = rf"\n\n=== MATERIAIS DE APOIO: {re.escape(filename)} ===\n.*?(?=\n\n=== MATERIAIS DE APOIO:|$)"
+        core.knowledge_text = re.sub(pattern, "", core.knowledge_text, flags=re.DOTALL)
+        
+    session.add(core)
+    session.commit()
+    return {"ok": True}

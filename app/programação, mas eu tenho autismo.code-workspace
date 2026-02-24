@@ -1,15 +1,10 @@
 {
-	"folders": [
-		{
-			"path": "../../frontender"
-		},
-		{
-			"path": ".."
-		}
-	],
-	"extensions": {
-		"recommendations": [
-			"icrawl.discord-vscode"
-		]
-	}
+    "folders": [
+        {
+            "path": "../../frontender"
+        },
+        {
+            "path": ".."
+        }
+    ]
 }

@@ -20,6 +20,9 @@ class Robot(SQLModel, table=True):
 
     system_instructions: str
     model: str = Field(default="gpt-4o-mini")
+    
+    # NOVO CAMPO: Guarda o log de arquivos subidos (ex: [{"filename": "doc.pdf", "date": "..."}])
+    knowledge_files_json: str = Field(default="[]")
 
     created_at: datetime = Field(default_factory=utcnow)
 
@@ -48,6 +51,9 @@ class BusinessCore(SQLModel, table=True):
     linkedin: str = Field(default="")
     youtube: str = Field(default="")
     tiktok: str = Field(default="")
+
+    knowledge_text: str = Field(default="") # Armazena todo o texto extraído dos arquivos
+    knowledge_files_json: str = Field(default="[]") # Histórico de arquivos enviados
     
     updated_at: datetime = Field(default_factory=utcnow)
 

@@ -2,6 +2,16 @@ from __future__ import annotations
 import json
 import uuid
 import hashlib
+import io
+try:
+    import pypdf
+except ImportError:
+    pypdf = None
+try:
+    import docx
+except ImportError:
+    docx = None
+    
 from datetime import datetime
 
 from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, UploadFile, File
@@ -33,7 +43,43 @@ from .schemas import (
 from .ai import build_robot_from_briefing, chat_with_robot, transcribe_audio, find_competitors, build_competition_result, authority_assistant, run_authority_agent
 
 app = FastAPI(title="Authority Robot Panel API")
+async def extract_text_from_file(file: UploadFile) -> str:
+    """Extrai texto de PDFs, DOCX ou arquivos de texto puro."""
+    content = await file.read()
+    filename = file.filename.lower()
+    text = ""
 
+    if filename.endswith(".pdf"):
+        if not pypdf:
+            raise HTTPException(status_code=500, detail="pypdf não instalado no backend.")
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            for page in reader.pages:
+                extracted = page.extract_text()
+                if extracted:
+                    text += extracted + "\n"
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Erro lendo PDF: {str(e)}")
+            
+    elif filename.endswith(".docx"):
+        if not docx:
+            raise HTTPException(status_code=500, detail="python-docx não instalado.")
+        try:
+            doc = docx.Document(io.BytesIO(content))
+            for para in doc.paragraphs:
+                text += para.text + "\n"
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Erro lendo DOCX: {str(e)}")
+            
+    elif filename.endswith(".txt") or filename.endswith(".md") or filename.endswith(".csv"):
+        try:
+            text = content.decode("utf-8")
+        except:
+            text = content.decode("latin-1", errors="ignore")
+    else:
+        raise HTTPException(status_code=400, detail="Formato não suportado. Use PDF, DOCX, TXT ou MD.")
+
+    return text.strip()
 # FERA MODE: CORS Permissivo para dev. Em prod, restrinja.
 app.add_middleware(
     CORSMiddleware,
@@ -83,6 +129,7 @@ def get_robot(public_id: str, session: Session = Depends(get_session)):
         avatar_data=robot.avatar_data,
         system_instructions=robot.system_instructions,
         created_at=robot.created_at.isoformat(),
+        knowledge_files_json=robot.knowledge_files_json
     )
 
 @app.delete("/api/robots/{public_id}")
@@ -137,6 +184,7 @@ def update_robot(public_id: str, body: RobotUpdateIn, session: Session = Depends
         avatar_data=robot.avatar_data,
         system_instructions=robot.system_instructions,
         created_at=robot.created_at.isoformat(),
+        knowledge_files_json=robot.knowledge_files_json
     )
 
 # --- BUSINESS CORE ROUTES ---
@@ -634,3 +682,80 @@ def authority_agents_run_compat(public_id: str, payload: AuthorityAgentRunIn, se
 @app.get("/api/robots/{public_id}/authority-agents/cooldown")
 def authority_agents_cooldown(public_id: str, agent_key: str, client_id: str = "", session: Session = Depends(get_session)):
     return {"cooldown_seconds": 0}
+
+@app.post("/api/robots/{public_id}/upload-knowledge", response_model=RobotDetail)
+async def upload_robot_knowledge(
+    public_id: str, 
+    file: UploadFile = File(...), 
+    session: Session = Depends(get_session)
+):
+    """Sobe um arquivo de instrução exclusivo para um robô específico."""
+    robot = _get_robot_or_404(public_id, session)
+    
+    text = await extract_text_from_file(file)
+    if not text:
+        raise HTTPException(status_code=400, detail="Arquivo vazio ou sem texto legível.")
+        
+    # Anexa o conteúdo como uma instrução permanente de contexto
+    separator = f"\n\n=== CONTEÚDO DO ARQUIVO: {file.filename} ===\n"
+    robot.system_instructions += f"{separator}{text}"
+    
+    # Registra no log de arquivos enviados
+    try:
+        files_list = json.loads(robot.knowledge_files_json or "[]")
+    except:
+        files_list = []
+    
+    files_list.append({"filename": file.filename, "uploaded_at": datetime.utcnow().isoformat()})
+    robot.knowledge_files_json = json.dumps(files_list, ensure_ascii=False)
+    
+    session.add(robot)
+    session.commit()
+    session.refresh(robot)
+    
+    return RobotDetail(
+        public_id=robot.public_id,
+        title=robot.title,
+        description=robot.description or "",
+        avatar_data=robot.avatar_data,
+        system_instructions=robot.system_instructions,
+        created_at=robot.created_at.isoformat(),
+        knowledge_files_json=robot.knowledge_files_json
+    )
+
+@app.post("/api/robots/{public_id}/business-core/upload-knowledge")
+async def upload_business_core_knowledge(
+    public_id: str, 
+    file: UploadFile = File(...), 
+    session: Session = Depends(get_session)
+):
+    """Sobe um arquivo com conhecimento base da Empresa."""
+    robot = _get_robot_or_404(public_id, session)
+    core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
+    
+    if not core:
+        core = BusinessCore(robot_id=robot.id)
+        session.add(core)
+        
+    text = await extract_text_from_file(file)
+    if not text:
+        raise HTTPException(status_code=400, detail="Arquivo vazio ou sem texto.")
+        
+    current_knowledge = core.knowledge_text or ""
+    separator = f"\n\n=== MATERIAIS DE APOIO: {file.filename} ===\n"
+    core.knowledge_text = f"{current_knowledge}{separator}{text}"
+    
+    try:
+        files_list = json.loads(core.knowledge_files_json or "[]")
+    except:
+        files_list = []
+        
+    files_list.append({"filename": file.filename, "uploaded_at": datetime.utcnow().isoformat()})
+    core.knowledge_files_json = json.dumps(files_list, ensure_ascii=False)
+    
+    core.updated_at = datetime.utcnow()
+    session.add(core)
+    session.commit()
+    session.refresh(core)
+    
+    return core

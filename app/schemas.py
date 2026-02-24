@@ -23,6 +23,8 @@ class RobotOut(BaseModel):
     created_at: str
 
 
+# Em app/schemas.py
+
 class RobotDetail(BaseModel):
     public_id: str
     title: str
@@ -30,6 +32,7 @@ class RobotDetail(BaseModel):
     avatar_data: Optional[str] = None
     system_instructions: str
     created_at: str
+    knowledge_files_json: str = "[]"  # NOVO CAMPO ADICIONADO AQUI
 
 
 class RobotUpdateIn(BaseModel):
@@ -161,3 +164,5 @@ class AuthorityAgentRunOut(BaseModel):
 
 class AuthorityAgentHistoryOut(BaseModel):
     items: list[AuthorityAgentRunOut]
+
+    

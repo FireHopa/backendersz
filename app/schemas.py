@@ -21,6 +21,7 @@ class Token(BaseModel):
     token_type: str = "bearer"
     user_name: Optional[str] = None
     user_email: str
+    credits: int = 100 # NOVO: Campo de créditos devolvido no login
 # =====================================
 
 class BriefingIn(BaseModel):

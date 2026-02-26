@@ -18,6 +18,10 @@ class User(SQLModel, table=True):
     hashed_password: Optional[str] = Field(default=None)
     google_id: Optional[str] = Field(default=None, index=True)
     
+    # NOVOS CAMPOS: Controle de créditos diários
+    credits: int = Field(default=100)
+    last_credit_reset: datetime = Field(default_factory=utcnow)
+    
     created_at: datetime = Field(default_factory=utcnow)
 
 class Robot(SQLModel, table=True):

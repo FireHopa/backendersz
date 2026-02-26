@@ -624,24 +624,6 @@ def _normalize_nucleus(nucleus: dict) -> dict:
             out[k] = norm(v)
     return out
 
-def _cooldown_check(session: Session, user_id: int, agent_key: str, cooldown_seconds: int = 3600):
-    last = session.exec(
-        select(AuthorityAgentRun)
-        .where(AuthorityAgentRun.user_id == user_id)
-        .where(AuthorityAgentRun.agent_key == agent_key)
-        .order_by(AuthorityAgentRun.created_at.desc())
-    ).first()
-    if not last:
-        return
-
-    elapsed = (datetime.utcnow() - last.created_at.replace(tzinfo=None)).total_seconds()
-    if elapsed < cooldown_seconds:
-        retry_after = int(cooldown_seconds - elapsed)
-        raise HTTPException(
-            status_code=429,
-            detail={"message": "Cooldown ativo para este agente.", "retry_after_seconds": retry_after},
-            headers={"Retry-After": str(retry_after)},
-        )
 
 @app.get("/api/authority-agents/history", response_model=AuthorityAgentHistoryOut)
 def authority_agents_history(client_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
@@ -680,8 +662,12 @@ def authority_agents_get_run(run_id: int, client_id: str, session: Session = Dep
 
 @app.post("/api/authority-agents/run", response_model=AuthorityAgentRunOut)
 def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    
+    # NOVO: Verificação de créditos antes de rodar a IA
+    if current_user.credits < 5:
+        raise HTTPException(status_code=403, detail="Créditos insuficientes. Precisas de 5 créditos para executar o agente de autoridade.")
+        
     nucleus = _normalize_nucleus(payload.nucleus)
-    _cooldown_check(session, current_user.id, payload.agent_key)
 
     global_robot = session.exec(select(Robot).where(Robot.public_id == "business-core-global")).first()
     if global_robot:
@@ -695,6 +681,10 @@ def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depend
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    # NOVO: Descontar os créditos pelo sucesso da execução
+    current_user.credits -= 5
+    session.add(current_user)
 
     run = AuthorityAgentRun(
         user_id=current_user.id,
@@ -720,6 +710,7 @@ def authority_agents_run_compat(public_id: str, payload: AuthorityAgentRunIn, se
 
 @app.get("/api/robots/{public_id}/authority-agents/cooldown")
 def authority_agents_cooldown(public_id: str, agent_key: str, client_id: str = "", session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    # Deixamos a devolver sempre 0 para garantir retrocompatibilidade e não quebrar frontends desatualizados.
     return {"cooldown_seconds": 0}
 
 @app.post("/api/robots/{public_id}/upload-knowledge", response_model=RobotDetail)

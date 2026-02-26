@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 
 from .db import init_db, get_session
-from .models import Robot, ChatMessage, CompetitionAnalysis, AuthorityEdit, AuthorityAgentRun, BusinessCore
+from .models import Robot, ChatMessage, CompetitionAnalysis, AuthorityEdit, AuthorityAgentRun, BusinessCore, User
 from .schemas import (
     BriefingIn,
     RobotOut,
@@ -43,10 +43,17 @@ from .schemas import (
 )
 from .ai import build_robot_from_briefing, chat_with_robot, transcribe_audio, find_competitors, build_competition_result, authority_assistant, run_authority_agent
 
+# Importações de Autenticação
+from .deps import get_current_user
+from .auth import router as auth_router
+
 app = FastAPI(title="Authority Robot Panel API")
 
+# Registando as rotas de Auth
+app.include_router(auth_router)
+
 async def extract_text_from_file(file: UploadFile) -> str:
-    """Extrai texto de PDFs, DOCX ou arquivos de texto puro."""
+    """Extrai texto de PDFs, DOCX ou ficheiros de texto puro."""
     content = await file.read()
     filename = file.filename.lower()
     text = ""
@@ -61,7 +68,7 @@ async def extract_text_from_file(file: UploadFile) -> str:
                 if extracted:
                     text += extracted + "\n"
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erro lendo PDF: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Erro ao ler o PDF: {str(e)}")
             
     elif filename.endswith(".docx"):
         if not docx:
@@ -71,7 +78,7 @@ async def extract_text_from_file(file: UploadFile) -> str:
             for para in doc.paragraphs:
                 text += para.text + "\n"
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erro lendo DOCX: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Erro ao ler o DOCX: {str(e)}")
             
     elif filename.endswith(".txt") or filename.endswith(".md") or filename.endswith(".csv"):
         try:
@@ -79,7 +86,7 @@ async def extract_text_from_file(file: UploadFile) -> str:
         except:
             text = content.decode("latin-1", errors="ignore")
     else:
-        raise HTTPException(status_code=400, detail="Formato não suportado. Use PDF, DOCX, TXT ou MD.")
+        raise HTTPException(status_code=400, detail="Formato não suportado. Utilize PDF, DOCX, TXT ou MD.")
 
     return text.strip()
 
@@ -99,32 +106,36 @@ def _startup():
 def health():
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
-# --- ROBOT HELPERS ---
-def _get_robot_or_404(public_id: str, session: Session) -> Robot:
-    robot = session.exec(select(Robot).where(Robot.public_id == public_id)).first()
-    
-    if not robot:
-        if public_id == "business-core-global":
+# --- ROBOT HELPERS (Atualizado para Isolamento Total) ---
+def _get_robot_or_404(public_id: str, session: Session, current_user: User) -> Robot:
+    if public_id == "business-core-global":
+        # O Núcleo Global continua a ser acessível a todos os utilizadores autenticados (para leitura)
+        robot = session.exec(select(Robot).where(Robot.public_id == public_id)).first()
+        if not robot:
             robot = Robot(
                 public_id="business-core-global",
                 title="[SISTEMA] Núcleo Global",
-                description="Armazena os arquivos do Núcleo da Empresa.",
+                description="Armazena os ficheiros do Núcleo da Empresa.",
                 system_instructions="Não usado diretamente no chat."
             )
             session.add(robot)
             session.commit()
             session.refresh(robot)
-            return robot
-            
-        raise HTTPException(status_code=404, detail="Assistente não encontrado")
+        return robot
+        
+    # Filtra rigorosamente pelo user_id do utilizador atual
+    robot = session.exec(select(Robot).where(Robot.public_id == public_id, Robot.user_id == current_user.id)).first()
+    if not robot:
+        raise HTTPException(status_code=404, detail="Assistente não encontrado ou não tem permissão para aceder.")
     return robot
 
 # --- ROBOT ROUTES ---
 @app.get("/api/robots", response_model=list[RobotOut])
-def list_robots(session: Session = Depends(get_session)):
+def list_robots(session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     robots = session.exec(
         select(Robot)
         .where(Robot.public_id != "business-core-global")
+        .where(Robot.user_id == current_user.id)  # Apenas os robôs do utilizador atual
         .order_by(Robot.created_at.desc())
     ).all()
     return [
@@ -139,8 +150,8 @@ def list_robots(session: Session = Depends(get_session)):
     ]
 
 @app.get("/api/robots/{public_id}", response_model=RobotDetail)
-def get_robot(public_id: str, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def get_robot(public_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     return RobotDetail(
         public_id=robot.public_id,
         title=robot.title,
@@ -152,8 +163,8 @@ def get_robot(public_id: str, session: Session = Depends(get_session)):
     )
 
 @app.delete("/api/robots/{public_id}")
-def delete_robot(public_id: str, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def delete_robot(public_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     msgs = session.exec(select(ChatMessage).where(ChatMessage.robot_id == robot.id)).all()
     for m in msgs:
         session.delete(m)
@@ -162,13 +173,14 @@ def delete_robot(public_id: str, session: Session = Depends(get_session)):
     return {"ok": True}
 
 @app.post("/api/robots", response_model=RobotOut)
-def create_robot(brief: BriefingIn, session: Session = Depends(get_session)):
+def create_robot(brief: BriefingIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     try:
         built = build_robot_from_briefing(brief.model_dump())
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     robot = Robot(
+        user_id=current_user.id,  # Associa o robô ao utilizador atual
         public_id=uuid.uuid4().hex,
         title=built["title"],
         description=built.get("description") or "",
@@ -188,8 +200,8 @@ def create_robot(brief: BriefingIn, session: Session = Depends(get_session)):
     )
 
 @app.patch("/api/robots/{public_id}", response_model=RobotDetail)
-def update_robot(public_id: str, body: RobotUpdateIn, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def update_robot(public_id: str, body: RobotUpdateIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     data = body.model_dump(exclude_unset=True)
     for k, v in data.items():
         setattr(robot, k, v)
@@ -208,8 +220,8 @@ def update_robot(public_id: str, body: RobotUpdateIn, session: Session = Depends
 
 # --- BUSINESS CORE ROUTES ---
 @app.get("/api/robots/{public_id}/business-core")
-def get_business_core(public_id: str, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def get_business_core(public_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
     
     if not core:
@@ -221,8 +233,8 @@ def get_business_core(public_id: str, session: Session = Depends(get_session)):
     return core
 
 @app.patch("/api/robots/{public_id}/business-core")
-def update_business_core(public_id: str, payload: dict, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def update_business_core(public_id: str, payload: dict, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
     
     if not core:
@@ -241,8 +253,8 @@ def update_business_core(public_id: str, payload: dict, session: Session = Depen
 
 # --- MESSAGES ROUTES ---
 @app.get("/api/robots/{public_id}/messages", response_model=list[ChatMessageOut])
-def list_messages(public_id: str, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def list_messages(public_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     msgs = session.exec(
         select(ChatMessage)
         .where(ChatMessage.robot_id == robot.id)
@@ -254,8 +266,8 @@ def list_messages(public_id: str, session: Session = Depends(get_session)):
     ]
 
 @app.post("/api/robots/{public_id}/authority-assistant", response_model=AuthorityAssistantOut)
-def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
 
     edits = session.exec(
         select(AuthorityEdit)
@@ -340,8 +352,8 @@ def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, sessio
     )
 
 @app.get("/api/robots/{public_id}/authority-edits", response_model=list[AuthorityEditOut])
-def list_authority_edits(public_id: str, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def list_authority_edits(public_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     edits = session.exec(
         select(AuthorityEdit)
         .where(AuthorityEdit.robot_id == robot.id)
@@ -367,8 +379,8 @@ def list_authority_edits(public_id: str, session: Session = Depends(get_session)
     return out
 
 @app.delete("/api/robots/{public_id}/messages")
-def clear_messages(public_id: str, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def clear_messages(public_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     msgs = session.exec(select(ChatMessage).where(ChatMessage.robot_id == robot.id)).all()
     for m in msgs:
         session.delete(m)
@@ -376,15 +388,15 @@ def clear_messages(public_id: str, session: Session = Depends(get_session)):
     return {"ok": True}
 
 @app.patch("/api/robots/{public_id}/messages/{message_id}", response_model=ChatMessageOut)
-def update_message(public_id: str, message_id: int, body: MessageUpdateIn, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def update_message(public_id: str, message_id: int, body: MessageUpdateIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     msg = session.exec(
         select(ChatMessage).where(ChatMessage.id == message_id, ChatMessage.robot_id == robot.id)
     ).first()
     if not msg:
         raise HTTPException(status_code=404, detail="Mensagem não encontrada")
     if msg.role != "user":
-        raise HTTPException(status_code=400, detail="Só é permitido editar mensagens do usuário")
+        raise HTTPException(status_code=400, detail="Só é permitido editar mensagens do utilizador")
 
     msg.content = body.content
     session.add(msg)
@@ -393,13 +405,13 @@ def update_message(public_id: str, message_id: int, body: MessageUpdateIn, sessi
     return ChatMessageOut(id=msg.id, role=msg.role, content=msg.content, created_at=msg.created_at.isoformat())
 
 @app.post("/api/robots/{public_id}/audio", response_model=ChatMessageOut)
-async def chat_audio(public_id: str, file: UploadFile = File(...), session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+async def chat_audio(public_id: str, file: UploadFile = File(...), session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     audio_bytes = await file.read()
     try:
         text = transcribe_audio(audio_bytes, filename=file.filename or "audio.webm")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Falha ao transcrever áudio: {e}")
+        raise HTTPException(status_code=400, detail=f"Falha ao transcrever o áudio: {e}")
 
     msgs = session.exec(
         select(ChatMessage)
@@ -431,8 +443,8 @@ async def chat_audio(public_id: str, file: UploadFile = File(...), session: Sess
     )
 
 @app.post("/api/robots/{public_id}/chat", response_model=ChatMessageOut)
-def chat(public_id: str, body: ChatIn, session: Session = Depends(get_session)):
-    robot = _get_robot_or_404(public_id, session)
+def chat(public_id: str, body: ChatIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    robot = _get_robot_or_404(public_id, session, current_user)
     msgs = session.exec(
         select(ChatMessage)
         .where(ChatMessage.robot_id == robot.id)
@@ -516,7 +528,7 @@ def _run_analysis_job(public_id: str):
 
 # --- COMPETITION ROUTES (V2 ONLY) ---
 @app.post("/api/competition/find-competitors", response_model=CompetitionFindOut)
-def competition_find_competitors_v2(payload: CompetitionFindRequest):
+def competition_find_competitors_v2(payload: CompetitionFindRequest, current_user: User = Depends(get_current_user)):
     briefing = payload.briefing.model_dump()
     mapped = {
         "company_name": briefing.get("nome_empresa"),
@@ -530,13 +542,14 @@ def competition_find_competitors_v2(payload: CompetitionFindRequest):
     return data
 
 @app.post("/api/competition/analyze", response_model=CompetitionJobV2Out)
-def competition_analyze_v2(payload: CompetitionAnalyzeRequest, bg: BackgroundTasks, session: Session = Depends(get_session)):
+def competition_analyze_v2(payload: CompetitionAnalyzeRequest, bg: BackgroundTasks, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     public_id = str(uuid.uuid4())
     instas = payload.instagrams or []
     sites = payload.sites or []
     briefing = payload.briefing.model_dump() if payload.briefing else None
 
     obj = CompetitionAnalysis(
+        user_id=current_user.id,  # Associa a análise ao utilizador logado
         public_id=public_id,
         instagrams_json=json.dumps(instas, ensure_ascii=False),
         sites_json=json.dumps(sites, ensure_ascii=False),
@@ -560,8 +573,8 @@ def competition_analyze_v2(payload: CompetitionAnalyzeRequest, bg: BackgroundTas
     )
 
 @app.get("/api/competition/jobs/{job_id}", response_model=CompetitionJobV2Out)
-def competition_job_v2(job_id: str, session: Session = Depends(get_session)):
-    obj = session.exec(select(CompetitionAnalysis).where(CompetitionAnalysis.public_id == job_id)).first()
+def competition_job_v2(job_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    obj = session.exec(select(CompetitionAnalysis).where(CompetitionAnalysis.public_id == job_id, CompetitionAnalysis.user_id == current_user.id)).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Job não encontrado")
     return CompetitionJobV2Out(
@@ -575,8 +588,8 @@ def competition_job_v2(job_id: str, session: Session = Depends(get_session)):
     )
 
 @app.get("/api/competition/reports/{report_id}", response_model=CompetitionReportV2Out)
-def competition_report_v2(report_id: str, session: Session = Depends(get_session)):
-    obj = session.exec(select(CompetitionAnalysis).where(CompetitionAnalysis.public_id == report_id)).first()
+def competition_report_v2(report_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    obj = session.exec(select(CompetitionAnalysis).where(CompetitionAnalysis.public_id == report_id, CompetitionAnalysis.user_id == current_user.id)).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Relatório não encontrado")
     
@@ -611,10 +624,10 @@ def _normalize_nucleus(nucleus: dict) -> dict:
             out[k] = norm(v)
     return out
 
-def _cooldown_check(session: Session, client_id: str, agent_key: str, cooldown_seconds: int = 3600):
+def _cooldown_check(session: Session, user_id: int, agent_key: str, cooldown_seconds: int = 3600):
     last = session.exec(
         select(AuthorityAgentRun)
-        .where(AuthorityAgentRun.client_id == client_id)
+        .where(AuthorityAgentRun.user_id == user_id)
         .where(AuthorityAgentRun.agent_key == agent_key)
         .order_by(AuthorityAgentRun.created_at.desc())
     ).first()
@@ -631,10 +644,10 @@ def _cooldown_check(session: Session, client_id: str, agent_key: str, cooldown_s
         )
 
 @app.get("/api/authority-agents/history", response_model=AuthorityAgentHistoryOut)
-def authority_agents_history(client_id: str, session: Session = Depends(get_session)):
+def authority_agents_history(client_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     items = session.exec(
         select(AuthorityAgentRun)
-        .where(AuthorityAgentRun.client_id == client_id)
+        .where(AuthorityAgentRun.user_id == current_user.id) # Ignora o client_id do frontend, foca no utilizador real
         .order_by(AuthorityAgentRun.created_at.desc())
         .limit(50)
     ).all()
@@ -652,11 +665,11 @@ def authority_agents_history(client_id: str, session: Session = Depends(get_sess
     }
 
 @app.get("/api/authority-agents/run/{run_id}", response_model=AuthorityAgentRunOut)
-def authority_agents_get_run(run_id: int, client_id: str, session: Session = Depends(get_session)):
+def authority_agents_get_run(run_id: int, client_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     run = session.get(AuthorityAgentRun, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Execução não encontrada.")
-    if run.client_id != client_id:
+    if run.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Acesso negado para esta execução.")
     return {
         "id": run.id,
@@ -666,9 +679,9 @@ def authority_agents_get_run(run_id: int, client_id: str, session: Session = Dep
     }
 
 @app.post("/api/authority-agents/run", response_model=AuthorityAgentRunOut)
-def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depends(get_session)):
+def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     nucleus = _normalize_nucleus(payload.nucleus)
-    _cooldown_check(session, payload.client_id, payload.agent_key)
+    _cooldown_check(session, current_user.id, payload.agent_key)
 
     global_robot = session.exec(select(Robot).where(Robot.public_id == "business-core-global")).first()
     if global_robot:
@@ -684,7 +697,8 @@ def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depend
         raise HTTPException(status_code=500, detail=str(e))
 
     run = AuthorityAgentRun(
-        client_id=payload.client_id,
+        user_id=current_user.id,
+        client_id=payload.client_id, # Mantém por retrocompatibilidade com o request antigo
         agent_key=payload.agent_key,
         nucleus_json=json.dumps(nucleus, ensure_ascii=False),
         output_text=output,
@@ -701,26 +715,27 @@ def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depend
     }
 
 @app.post("/api/robots/{public_id}/authority-agents/run", response_model=AuthorityAgentRunOut)
-def authority_agents_run_compat(public_id: str, payload: AuthorityAgentRunIn, session: Session = Depends(get_session)):
-    return authority_agents_run(payload, session)
+def authority_agents_run_compat(public_id: str, payload: AuthorityAgentRunIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    return authority_agents_run(payload, session, current_user)
 
 @app.get("/api/robots/{public_id}/authority-agents/cooldown")
-def authority_agents_cooldown(public_id: str, agent_key: str, client_id: str = "", session: Session = Depends(get_session)):
+def authority_agents_cooldown(public_id: str, agent_key: str, client_id: str = "", session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     return {"cooldown_seconds": 0}
 
 @app.post("/api/robots/{public_id}/upload-knowledge", response_model=RobotDetail)
 async def upload_robot_knowledge(
     public_id: str, 
     file: UploadFile = File(...), 
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user)
 ):
-    robot = _get_robot_or_404(public_id, session)
+    robot = _get_robot_or_404(public_id, session, current_user)
     
     text = await extract_text_from_file(file)
     if not text:
-        raise HTTPException(status_code=400, detail="Arquivo vazio ou sem texto legível.")
+        raise HTTPException(status_code=400, detail="Ficheiro vazio ou sem texto legível.")
         
-    separator = f"\n\n=== CONTEÚDO DO ARQUIVO: {file.filename} ===\n"
+    separator = f"\n\n=== CONTEÚDO DO FICHEIRO: {file.filename} ===\n"
     robot.system_instructions += f"{separator}{text}"
     
     try:
@@ -746,9 +761,9 @@ async def upload_robot_knowledge(
     )
 
 @app.delete("/api/robots/{public_id}/knowledge-files/{filename}")
-def delete_robot_file(public_id: str, filename: str, session: Session = Depends(get_session)):
-    """Deleta um arquivo de conhecimento do robô."""
-    robot = _get_robot_or_404(public_id, session)
+def delete_robot_file(public_id: str, filename: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    """Apaga um ficheiro de conhecimento do robô."""
+    robot = _get_robot_or_404(public_id, session, current_user)
     try:
         files_list = json.loads(robot.knowledge_files_json or "[]")
     except:
@@ -759,7 +774,7 @@ def delete_robot_file(public_id: str, filename: str, session: Session = Depends(
     
     # Remove do texto mestre
     if robot.system_instructions:
-        pattern = rf"\n\n=== CONTEÚDO DO ARQUIVO: {re.escape(filename)} ===\n.*?(?=\n\n=== CONTEÚDO DO ARQUIVO:|$)"
+        pattern = rf"\n\n=== CONTEÚDO DO FICHEIRO: {re.escape(filename)} ===\n.*?(?=\n\n=== CONTEÚDO DO FICHEIRO:|$)"
         robot.system_instructions = re.sub(pattern, "", robot.system_instructions, flags=re.DOTALL)
         
     session.add(robot)
@@ -770,9 +785,10 @@ def delete_robot_file(public_id: str, filename: str, session: Session = Depends(
 async def upload_business_core_knowledge(
     public_id: str, 
     file: UploadFile = File(...), 
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user)
 ):
-    robot = _get_robot_or_404(public_id, session)
+    robot = _get_robot_or_404(public_id, session, current_user)
     core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
     
     if not core:
@@ -781,7 +797,7 @@ async def upload_business_core_knowledge(
         
     text = await extract_text_from_file(file)
     if not text:
-        raise HTTPException(status_code=400, detail="Arquivo vazio ou sem texto.")
+        raise HTTPException(status_code=400, detail="Ficheiro vazio ou sem texto.")
         
     current_knowledge = getattr(core, 'knowledge_text', '') or ""
     separator = f"\n\n=== MATERIAIS DE APOIO: {file.filename} ===\n"
@@ -803,9 +819,9 @@ async def upload_business_core_knowledge(
     return core
 
 @app.delete("/api/robots/{public_id}/business-core/files/{filename}")
-def delete_business_core_file(public_id: str, filename: str, session: Session = Depends(get_session)):
-    """Deleta um arquivo de conhecimento do Núcleo."""
-    robot = _get_robot_or_404(public_id, session)
+def delete_business_core_file(public_id: str, filename: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    """Apaga um ficheiro de conhecimento do Núcleo."""
+    robot = _get_robot_or_404(public_id, session, current_user)
     core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
     
     if not core:

@@ -3,6 +3,25 @@ from __future__ import annotations
 from typing import Optional
 from pydantic import BaseModel, Field
 
+# === NOVOS SCHEMAS DE AUTENTICAÇÃO ===
+class UserCreate(BaseModel):
+    email: str
+    password: str
+    full_name: Optional[str] = None
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class GoogleAuth(BaseModel):
+    credential: str  # O token JWT retornado pelo popup do Google no Frontend
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_name: Optional[str] = None
+    user_email: str
+# =====================================
 
 class BriefingIn(BaseModel):
     company_name: str
@@ -23,8 +42,6 @@ class RobotOut(BaseModel):
     created_at: str
 
 
-# Em app/schemas.py
-
 class RobotDetail(BaseModel):
     public_id: str
     title: str
@@ -32,7 +49,7 @@ class RobotDetail(BaseModel):
     avatar_data: Optional[str] = None
     system_instructions: str
     created_at: str
-    knowledge_files_json: str = "[]"  # NOVO CAMPO ADICIONADO AQUI
+    knowledge_files_json: str = "[]"
 
 
 class RobotUpdateIn(BaseModel):
@@ -84,13 +101,11 @@ class AuthorityEditOut(BaseModel):
     after_score: int = 0
 
 
-
 # -----------------------------
 # Competition module (PT-BR)
 # -----------------------------
 
 class CompetitionBriefingPT(BaseModel):
-    """Briefing em português (campos esperados pelo frontend)."""
     nome_empresa: Optional[str] = None
     cidade_estado: str
     bairro: Optional[str] = None
@@ -99,7 +114,7 @@ class CompetitionBriefingPT(BaseModel):
     publico_alvo: str
     regiao_atendimento: str
     diferencial: Optional[str] = None
-    nivel_preco: Optional[str] = None  # popular|medio|premium
+    nivel_preco: Optional[str] = None 
     objetivo: Optional[str] = None
     instagram: Optional[str] = None
     site: Optional[str] = None
@@ -131,9 +146,6 @@ class CompetitionReportV2Out(BaseModel):
     updated_at: Optional[str] = None
 
 
-
-
-
 class CompetitorSuggestion(BaseModel):
     name: str
     website_url: Optional[str] = None
@@ -146,7 +158,6 @@ class CompetitionFindOut(BaseModel):
     sources: list[dict] = []
     note: Optional[str] = None
     data_quality: Optional[str] = None
-
 
 
 class AuthorityAgentRunIn(BaseModel):
@@ -164,5 +175,3 @@ class AuthorityAgentRunOut(BaseModel):
 
 class AuthorityAgentHistoryOut(BaseModel):
     items: list[AuthorityAgentRunOut]
-
-    

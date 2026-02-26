@@ -8,10 +8,26 @@ from sqlmodel import SQLModel, Field
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+class User(SQLModel, table=True):
+    __tablename__ = "user"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(unique=True, index=True)
+    full_name: Optional[str] = Field(default=None)
+    
+    hashed_password: Optional[str] = Field(default=None)
+    google_id: Optional[str] = Field(default=None, index=True)
+    
+    created_at: datetime = Field(default_factory=utcnow)
+
 class Robot(SQLModel, table=True):
     __tablename__ = "robot"
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    
+    # NOVO: Relacionamento com o dono do robô
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    
     public_id: str = Field(index=True, unique=True)
 
     title: str
@@ -21,7 +37,6 @@ class Robot(SQLModel, table=True):
     system_instructions: str
     model: str = Field(default="gpt-4o-mini")
     
-    # NOVO CAMPO: Guarda o log de arquivos subidos (ex: [{"filename": "doc.pdf", "date": "..."}])
     knowledge_files_json: str = Field(default="[]")
 
     created_at: datetime = Field(default_factory=utcnow)
@@ -52,8 +67,8 @@ class BusinessCore(SQLModel, table=True):
     youtube: str = Field(default="")
     tiktok: str = Field(default="")
 
-    knowledge_text: str = Field(default="") # Armazena todo o texto extraído dos arquivos
-    knowledge_files_json: str = Field(default="[]") # Histórico de arquivos enviados
+    knowledge_text: str = Field(default="") 
+    knowledge_files_json: str = Field(default="[]") 
     
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -69,6 +84,10 @@ class ChatMessage(SQLModel, table=True):
 
 class CompetitionAnalysis(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
+    
+    # NOVO: Relacionamento com o dono da análise
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    
     public_id: str = Field(index=True, unique=True)
     instagrams_json: str = Field(default="[]")
     sites_json: str = Field(default="[]")
@@ -107,7 +126,13 @@ class AuthorityAgentRun(SQLModel, table=True):
     __tablename__ = "authority_agent_run"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    client_id: str = Field(index=True)
+    
+    # NOVO: Relacionamento com o usuário logado
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    
+    # Mantivemos o client_id apenas para o Frontend não quebrar ao enviar, 
+    # mas o backend vai ignorar ele e usar o user_id real.
+    client_id: str = Field(index=True) 
     agent_key: str = Field(index=True)
     nucleus_json: str
     output_text: str

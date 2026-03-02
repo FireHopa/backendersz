@@ -464,3 +464,55 @@ def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
         max_tokens=4000,
     )
     return (resp.choices[0].message.content or "").strip()
+
+def suggest_themes_for_task(agent_key: str, nucleus: dict, task: str) -> list[str]:
+    _require_key()
+    
+    prompt = f"""
+    Você é um estrategista de conteúdo especialista em SEO, AEO e GEO.
+    O usuário pediu para executar a tarefa: "{task}".
+    
+    Baseando-se EXCLUSIVAMENTE nas informações do núcleo da empresa abaixo, sugira exatamente 5 temas ou tópicos de conteúdo que façam sentido para essa empresa.
+    Seja criativo mas extremamente focado na área de atuação, serviços e público-alvo informados. Os temas devem ser voltados a quebrar objeções e ajudar o cliente a decidir pela compra.
+    
+    Núcleo da Empresa:
+    {json.dumps(nucleus, ensure_ascii=False)}
+    
+    Retorne APENAS um JSON válido no formato abaixo, sem formatação markdown:
+    {{
+      "themes": [
+        "Sugestão de Tema 1",
+        "Sugestão de Tema 2",
+        "Sugestão de Tema 3",
+        "Sugestão de Tema 4",
+        "Sugestão de Tema 5"
+      ]
+    }}
+    """
+    
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.7
+        )
+        
+        text = (resp.choices[0].message.content or "").strip()
+        data = json.loads(text)
+        return data.get("themes", [
+            "Os 5 principais mitos do nosso serviço",
+            "Como funciona o nosso processo passo a passo",
+            "Respondendo as dúvidas mais comuns dos nossos clientes",
+            "Estudo de caso: Como resolvemos o problema",
+            "O que você precisa saber antes de contratar"
+        ])
+    except Exception as e:
+        print("Erro ao gerar temas:", e)
+        return [
+            "Por que escolher o nosso serviço?",
+            "Como funciona o nosso atendimento",
+            "Dúvidas frequentes de novos clientes",
+            "Os maiores erros antes de contratar um profissional",
+            "Tudo que está incluso na nossa entrega"
+        ]

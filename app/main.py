@@ -46,6 +46,12 @@ from .ai import build_robot_from_briefing, chat_with_robot, transcribe_audio, fi
 # Importações de Autenticação
 from .deps import get_current_user
 from .auth import router as auth_router
+from pydantic import BaseModel
+
+class SuggestThemesRequest(BaseModel):
+    agent_key: str
+    task: str
+    nucleus: dict
 
 app = FastAPI(title="Authority Robot Panel API")
 
@@ -833,3 +839,11 @@ def delete_business_core_file(public_id: str, filename: str, session: Session = 
     session.add(core)
     session.commit()
     return {"ok": True}
+@app.post("/api/authority-agents/suggest-themes")
+def authority_agents_suggest_themes(payload: SuggestThemesRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    from .ai import suggest_themes_for_task
+    try:
+        themes = suggest_themes_for_task(payload.agent_key, payload.nucleus, payload.task)
+        return {"themes": themes}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

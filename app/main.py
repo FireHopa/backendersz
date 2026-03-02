@@ -4,6 +4,9 @@ import uuid
 import hashlib
 import io
 import re
+import httpx
+from urllib.parse import urlencode
+
 try:
     import pypdf
 except ImportError:
@@ -13,12 +16,13 @@ try:
 except ImportError:
     docx = None
     
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 
+from .config import LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET, LINKEDIN_REDIRECT_URI
 from .db import init_db, get_session
 from .models import Robot, ChatMessage, CompetitionAnalysis, AuthorityEdit, AuthorityAgentRun, BusinessCore, User
 from .schemas import (
@@ -40,10 +44,10 @@ from .schemas import (
     CompetitionJobV2Out,
     CompetitionReportV2Out,
     CompetitionFindOut,
+    LinkedInConnectIn
 )
 from .ai import build_robot_from_briefing, chat_with_robot, transcribe_audio, find_competitors, build_competition_result, authority_assistant, run_authority_agent
 
-# Importações de Autenticação
 from .deps import get_current_user
 from .auth import router as auth_router
 from pydantic import BaseModel
@@ -55,11 +59,9 @@ class SuggestThemesRequest(BaseModel):
 
 app = FastAPI(title="Authority Robot Panel API")
 
-# Registando as rotas de Auth
 app.include_router(auth_router)
 
 async def extract_text_from_file(file: UploadFile) -> str:
-    """Extrai texto de PDFs, DOCX ou ficheiros de texto puro."""
     content = await file.read()
     filename = file.filename.lower()
     text = ""
@@ -112,10 +114,8 @@ def _startup():
 def health():
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
-# --- ROBOT HELPERS (Atualizado para Isolamento Total) ---
 def _get_robot_or_404(public_id: str, session: Session, current_user: User) -> Robot:
     if public_id == "business-core-global":
-        # O Núcleo Global continua a ser acessível a todos os utilizadores autenticados (para leitura)
         robot = session.exec(select(Robot).where(Robot.public_id == public_id)).first()
         if not robot:
             robot = Robot(
@@ -129,19 +129,17 @@ def _get_robot_or_404(public_id: str, session: Session, current_user: User) -> R
             session.refresh(robot)
         return robot
         
-    # Filtra rigorosamente pelo user_id do utilizador atual
     robot = session.exec(select(Robot).where(Robot.public_id == public_id, Robot.user_id == current_user.id)).first()
     if not robot:
         raise HTTPException(status_code=404, detail="Assistente não encontrado ou não tem permissão para aceder.")
     return robot
 
-# --- ROBOT ROUTES ---
 @app.get("/api/robots", response_model=list[RobotOut])
 def list_robots(session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     robots = session.exec(
         select(Robot)
         .where(Robot.public_id != "business-core-global")
-        .where(Robot.user_id == current_user.id)  # Apenas os robôs do utilizador atual
+        .where(Robot.user_id == current_user.id)
         .order_by(Robot.created_at.desc())
     ).all()
     return [
@@ -186,7 +184,7 @@ def create_robot(brief: BriefingIn, session: Session = Depends(get_session), cur
         raise HTTPException(status_code=400, detail=str(e))
 
     robot = Robot(
-        user_id=current_user.id,  # Associa o robô ao utilizador atual
+        user_id=current_user.id,
         public_id=uuid.uuid4().hex,
         title=built["title"],
         description=built.get("description") or "",
@@ -224,7 +222,6 @@ def update_robot(public_id: str, body: RobotUpdateIn, session: Session = Depends
         knowledge_files_json=robot.knowledge_files_json
     )
 
-# --- BUSINESS CORE ROUTES ---
 @app.get("/api/robots/{public_id}/business-core")
 def get_business_core(public_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     robot = _get_robot_or_404(public_id, session, current_user)
@@ -257,7 +254,6 @@ def update_business_core(public_id: str, payload: dict, session: Session = Depen
     session.refresh(core)
     return core
 
-# --- MESSAGES ROUTES ---
 @app.get("/api/robots/{public_id}/messages", response_model=list[ChatMessageOut])
 def list_messages(public_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     robot = _get_robot_or_404(public_id, session, current_user)
@@ -480,7 +476,6 @@ def chat(public_id: str, body: ChatIn, session: Session = Depends(get_session), 
         created_at=assistant_msg.created_at.isoformat(),
     )
 
-# --- COMPETITION HELPERS ---
 def _update_analysis(session, obj, **kwargs):
     for k, v in kwargs.items():
         setattr(obj, k, v)
@@ -520,7 +515,6 @@ def _run_analysis_job(public_id: str):
                 competitors.append({"name": _domain(s), "website_url": s})
             
             _update_analysis(session, obj, stage="Analisando presença digital", progress=0.40)
-            
             _update_analysis(session, obj, stage="Consolidando inteligência", progress=0.75)
 
             result = build_competition_result(company=company, competitors=competitors[:3])
@@ -530,9 +524,7 @@ def _run_analysis_job(public_id: str):
         except Exception as e:
             if obj:
                 _update_analysis(session, obj, status="error", stage="Erro no processamento", progress=1.0, error=str(e))
-            print(f"Job Error: {e}")
 
-# --- COMPETITION ROUTES (V2 ONLY) ---
 @app.post("/api/competition/find-competitors", response_model=CompetitionFindOut)
 def competition_find_competitors_v2(payload: CompetitionFindRequest, current_user: User = Depends(get_current_user)):
     briefing = payload.briefing.model_dump()
@@ -555,7 +547,7 @@ def competition_analyze_v2(payload: CompetitionAnalyzeRequest, bg: BackgroundTas
     briefing = payload.briefing.model_dump() if payload.briefing else None
 
     obj = CompetitionAnalysis(
-        user_id=current_user.id,  # Associa a análise ao utilizador logado
+        user_id=current_user.id,
         public_id=public_id,
         instagrams_json=json.dumps(instas, ensure_ascii=False),
         sites_json=json.dumps(sites, ensure_ascii=False),
@@ -630,12 +622,11 @@ def _normalize_nucleus(nucleus: dict) -> dict:
             out[k] = norm(v)
     return out
 
-
 @app.get("/api/authority-agents/history", response_model=AuthorityAgentHistoryOut)
 def authority_agents_history(client_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     items = session.exec(
         select(AuthorityAgentRun)
-        .where(AuthorityAgentRun.user_id == current_user.id) # Ignora o client_id do frontend, foca no utilizador real
+        .where(AuthorityAgentRun.user_id == current_user.id)
         .order_by(AuthorityAgentRun.created_at.desc())
         .limit(50)
     ).all()
@@ -668,8 +659,6 @@ def authority_agents_get_run(run_id: int, client_id: str, session: Session = Dep
 
 @app.post("/api/authority-agents/run", response_model=AuthorityAgentRunOut)
 def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    
-    # NOVO: Verificação de créditos antes de rodar a IA
     if current_user.credits < 5:
         raise HTTPException(status_code=403, detail="Créditos insuficientes. Precisas de 5 créditos para executar o agente de autoridade.")
         
@@ -688,13 +677,12 @@ def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depend
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # NOVO: Descontar os créditos pelo sucesso da execução
     current_user.credits -= 5
     session.add(current_user)
 
     run = AuthorityAgentRun(
         user_id=current_user.id,
-        client_id=payload.client_id, # Mantém por retrocompatibilidade com o request antigo
+        client_id=payload.client_id,
         agent_key=payload.agent_key,
         nucleus_json=json.dumps(nucleus, ensure_ascii=False),
         output_text=output,
@@ -716,7 +704,6 @@ def authority_agents_run_compat(public_id: str, payload: AuthorityAgentRunIn, se
 
 @app.get("/api/robots/{public_id}/authority-agents/cooldown")
 def authority_agents_cooldown(public_id: str, agent_key: str, client_id: str = "", session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    # Deixamos a devolver sempre 0 para garantir retrocompatibilidade e não quebrar frontends desatualizados.
     return {"cooldown_seconds": 0}
 
 @app.post("/api/robots/{public_id}/upload-knowledge", response_model=RobotDetail)
@@ -759,7 +746,6 @@ async def upload_robot_knowledge(
 
 @app.delete("/api/robots/{public_id}/knowledge-files/{filename}")
 def delete_robot_file(public_id: str, filename: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    """Apaga um ficheiro de conhecimento do robô."""
     robot = _get_robot_or_404(public_id, session, current_user)
     try:
         files_list = json.loads(robot.knowledge_files_json or "[]")
@@ -769,7 +755,6 @@ def delete_robot_file(public_id: str, filename: str, session: Session = Depends(
     new_list = [f for f in files_list if f.get("filename") != filename]
     robot.knowledge_files_json = json.dumps(new_list, ensure_ascii=False)
     
-    # Remove do texto mestre
     if robot.system_instructions:
         pattern = rf"\n\n=== CONTEÚDO DO FICHEIRO: {re.escape(filename)} ===\n.*?(?=\n\n=== CONTEÚDO DO FICHEIRO:|$)"
         robot.system_instructions = re.sub(pattern, "", robot.system_instructions, flags=re.DOTALL)
@@ -817,7 +802,6 @@ async def upload_business_core_knowledge(
 
 @app.delete("/api/robots/{public_id}/business-core/files/{filename}")
 def delete_business_core_file(public_id: str, filename: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    """Apaga um ficheiro de conhecimento do Núcleo."""
     robot = _get_robot_or_404(public_id, session, current_user)
     core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
     
@@ -839,6 +823,7 @@ def delete_business_core_file(public_id: str, filename: str, session: Session = 
     session.add(core)
     session.commit()
     return {"ok": True}
+
 @app.post("/api/authority-agents/suggest-themes")
 def authority_agents_suggest_themes(payload: SuggestThemesRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     from .ai import suggest_themes_for_task
@@ -847,3 +832,96 @@ def authority_agents_suggest_themes(payload: SuggestThemesRequest, session: Sess
         return {"themes": themes}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# ROTAS DO LINKEDIN OAUTH2
+# ==========================================
+
+@app.get("/api/linkedin/auth-url")
+def get_linkedin_auth_url(current_user: User = Depends(get_current_user)):
+    """Gera o link de autorização para o Frontend redirecionar o utilizador."""
+    scopes = "w_member_social openid profile email"
+    params = {
+        "response_type": "code",
+        "client_id": LINKEDIN_CLIENT_ID,
+        "redirect_uri": LINKEDIN_REDIRECT_URI,
+        "state": uuid.uuid4().hex,  # Segurança contra ataques CSRF
+        "scope": scopes
+    }
+    url = f"https://www.linkedin.com/oauth/v2/authorization?{urlencode(params)}"
+    return {"url": url}
+
+@app.post("/api/linkedin/connect")
+async def connect_linkedin(payload: LinkedInConnectIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    """Recebe o 'code' do Frontend e troca pelo Access Token."""
+    token_url = "https://www.linkedin.com/oauth/v2/accessToken"
+    data = {
+        "grant_type": "authorization_code",
+        "code": payload.code,
+        "client_id": LINKEDIN_CLIENT_ID,
+        "client_secret": LINKEDIN_CLIENT_SECRET,
+        "redirect_uri": LINKEDIN_REDIRECT_URI
+    }
+    
+    async with httpx.AsyncClient() as client:
+        # 1. Trocar código por token
+        resp = await client.post(token_url, data=data)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Erro ao ligar ao LinkedIn: {resp.text}")
+        
+        token_data = resp.json()
+        access_token = token_data.get("access_token")
+        expires_in = token_data.get("expires_in", 0)
+        
+        # 2. Buscar o URN do Utilizador (obrigatório para publicar via API)
+        profile_url = "https://api.linkedin.com/v2/userinfo"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        prof_resp = await client.get(profile_url, headers=headers)
+        
+        if prof_resp.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Erro ao obter perfil: {prof_resp.text}")
+        
+        prof_data = prof_resp.json()
+        # O LinkedIn devolve o URN no formato id no campo 'sub' da API OpenID
+        linkedin_urn = f"urn:li:person:{prof_data.get('sub')}"
+
+        # 3. Guardar tudo de forma segura na base de dados do utilizador
+        current_user.linkedin_access_token = access_token
+        current_user.linkedin_token_expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+        current_user.linkedin_urn = linkedin_urn
+        
+        session.add(current_user)
+        session.commit()
+        
+        return {"ok": True, "message": "Conta do LinkedIn conectada com sucesso!"}
+
+@app.post("/api/linkedin/publish")
+async def publish_linkedin(payload: dict, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    if not current_user.linkedin_access_token or not current_user.linkedin_urn:
+        raise HTTPException(status_code=400, detail="LinkedIn não está conectado nesta conta.")
+        
+    url = "https://api.linkedin.com/v2/ugcPosts"
+    headers = {
+        "Authorization": f"Bearer {current_user.linkedin_access_token}",
+        "X-Restli-Protocol-Version": "2.0.0",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "author": current_user.linkedin_urn,
+        "lifecycleState": "PUBLISHED",
+        "specificContent": {
+            "com.linkedin.ugc.ShareContent": {
+                "shareCommentary": {"text": payload.get("text")}, # O texto que o usuário revisou
+                "shareMediaCategory": "NONE"
+            }
+        },
+        "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"}
+    }
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json=data)
+        if resp.status_code != 201:
+            raise HTTPException(status_code=400, detail=f"Erro da API do LinkedIn: {resp.text}")
+            
+    return {"ok": True}

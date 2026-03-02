@@ -18,9 +18,14 @@ class User(SQLModel, table=True):
     hashed_password: Optional[str] = Field(default=None)
     google_id: Optional[str] = Field(default=None, index=True)
     
-    # NOVOS CAMPOS: Controle de créditos diários
+    # Controle de créditos diários
     credits: int = Field(default=100)
     last_credit_reset: datetime = Field(default_factory=utcnow)
+    
+    # NOVOS CAMPOS: Autenticação LinkedIn
+    linkedin_access_token: Optional[str] = Field(default=None)
+    linkedin_token_expires_at: Optional[datetime] = Field(default=None)
+    linkedin_urn: Optional[str] = Field(default=None) # Necessário para postar (ex: urn:li:person:12345)
     
     created_at: datetime = Field(default_factory=utcnow)
 
@@ -28,10 +33,7 @@ class Robot(SQLModel, table=True):
     __tablename__ = "robot"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    
-    # NOVO: Relacionamento com o dono do robô
     user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
-    
     public_id: str = Field(index=True, unique=True)
 
     title: str
@@ -88,10 +90,7 @@ class ChatMessage(SQLModel, table=True):
 
 class CompetitionAnalysis(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    
-    # NOVO: Relacionamento com o dono da análise
     user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
-    
     public_id: str = Field(index=True, unique=True)
     instagrams_json: str = Field(default="[]")
     sites_json: str = Field(default="[]")
@@ -130,12 +129,7 @@ class AuthorityAgentRun(SQLModel, table=True):
     __tablename__ = "authority_agent_run"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    
-    # NOVO: Relacionamento com o usuário logado
     user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
-    
-    # Mantivemos o client_id apenas para o Frontend não quebrar ao enviar, 
-    # mas o backend vai ignorar ele e usar o user_id real.
     client_id: str = Field(index=True) 
     agent_key: str = Field(index=True)
     nucleus_json: str

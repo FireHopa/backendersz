@@ -14,14 +14,14 @@ class UserLogin(BaseModel):
     password: str
 
 class GoogleAuth(BaseModel):
-    credential: str  # O token JWT retornado pelo popup do Google no Frontend
+    credential: str
 
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user_name: Optional[str] = None
     user_email: str
-    credits: int = 100 # NOVO: Campo de créditos devolvido no login
+    credits: int = 100
 # =====================================
 
 class BriefingIn(BaseModel):
@@ -34,14 +34,12 @@ class BriefingIn(BaseModel):
     competitors: Optional[str] = ""
     goals: str = "Aumentar autoridade e ser citado por IA"
 
-
 class RobotOut(BaseModel):
     public_id: str
     title: str
     description: str = ""
     avatar_data: Optional[str] = None
     created_at: str
-
 
 class RobotDetail(BaseModel):
     public_id: str
@@ -52,13 +50,11 @@ class RobotDetail(BaseModel):
     created_at: str
     knowledge_files_json: str = "[]"
 
-
 class RobotUpdateIn(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     avatar_data: Optional[str] = None
     system_instructions: Optional[str] = None
-
 
 class ChatIn(BaseModel):
     message: str
@@ -66,13 +62,11 @@ class ChatIn(BaseModel):
     web_max_results: int = Field(default=5, ge=1, le=20)
     web_allowed_domains: Optional[list[str]] = None
 
-
 class ChatMessageOut(BaseModel):
     id: int
     role: str
     content: str
     created_at: str
-
 
 class MessageUpdateIn(BaseModel):
     content: str = Field(min_length=1)
@@ -80,7 +74,6 @@ class MessageUpdateIn(BaseModel):
 class AuthorityAssistantIn(BaseModel):
     message: str = Field(min_length=1)
     history: Optional[list[dict]] = None
-
 
 class AuthorityAssistantOut(BaseModel):
     apply_change: bool
@@ -100,11 +93,6 @@ class AuthorityEditOut(BaseModel):
     changes_made: list[dict] = []
     before_score: int = 0
     after_score: int = 0
-
-
-# -----------------------------
-# Competition module (PT-BR)
-# -----------------------------
 
 class CompetitionBriefingPT(BaseModel):
     nome_empresa: Optional[str] = None
@@ -146,7 +134,6 @@ class CompetitionReportV2Out(BaseModel):
     result: dict
     updated_at: Optional[str] = None
 
-
 class CompetitorSuggestion(BaseModel):
     name: str
     website_url: Optional[str] = None
@@ -160,12 +147,10 @@ class CompetitionFindOut(BaseModel):
     note: Optional[str] = None
     data_quality: Optional[str] = None
 
-
 class AuthorityAgentRunIn(BaseModel):
     client_id: str = Field(..., description="Identificador do cliente (armazenado no localStorage).")
     agent_key: str
     nucleus: dict
-
 
 class AuthorityAgentRunOut(BaseModel):
     id: int
@@ -173,6 +158,9 @@ class AuthorityAgentRunOut(BaseModel):
     output_text: str
     created_at: str
 
-
 class AuthorityAgentHistoryOut(BaseModel):
     items: list[AuthorityAgentRunOut]
+
+# === NOVOS SCHEMAS LINKEDIN ===
+class LinkedInConnectIn(BaseModel):
+    code: str

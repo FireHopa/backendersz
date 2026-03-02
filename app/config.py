@@ -16,7 +16,11 @@ SERPER_GL = os.getenv("SERPER_GL", "br").strip()          # country code
 SERPER_HL = os.getenv("SERPER_HL", "pt-br").strip()       # language
 SERPER_LOCATION = os.getenv("SERPER_LOCATION", "Brazil").strip()
 
-
 # Web Search (Serper) para chat
 ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "false").strip().lower() in {"1","true","yes","y"}
 WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
+
+# LINKEDIN OAUTH2
+LINKEDIN_CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID", "").strip()
+LINKEDIN_CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET", "").strip()
+LINKEDIN_REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI", "http://localhost:8000/api/linkedin/callback").strip()

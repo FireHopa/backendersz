@@ -22,6 +22,7 @@ class Token(BaseModel):
     user_name: Optional[str] = None
     user_email: str
     credits: int = 100
+    has_linkedin: bool = False
 # =====================================
 
 class BriefingIn(BaseModel):

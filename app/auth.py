@@ -46,7 +46,8 @@ def register(user_in: UserCreate, session: Session = Depends(get_session)):
         "token_type": "bearer", 
         "user_email": new_user.email, 
         "user_name": new_user.full_name,
-        "credits": new_user.credits
+        "credits": new_user.credits,
+        "has_linkedin": bool(new_user.linkedin_urn)
     }
 
 @router.post("/login", response_model=Token)
@@ -66,7 +67,8 @@ def login(user_in: UserLogin, session: Session = Depends(get_session)):
         "token_type": "bearer", 
         "user_email": user.email, 
         "user_name": user.full_name,
-        "credits": user.credits
+        "credits": user.credits,
+        "has_linkedin": bool(user.linkedin_urn)
     }
 
 @router.post("/google", response_model=Token)
@@ -110,7 +112,8 @@ def google_auth(auth_in: GoogleAuth, session: Session = Depends(get_session)):
             "token_type": "bearer", 
             "user_email": user.email, 
             "user_name": user.full_name,
-            "credits": user.credits
+            "credits": user.credits,
+            "has_linkedin": bool(user.linkedin_urn)
         }
         
     except Exception as e:
@@ -128,5 +131,6 @@ def get_me(current_user: User = Depends(get_current_user), session: Session = De
         "email": current_user.email,
         "full_name": current_user.full_name,
         "google_id": current_user.google_id,
-        "credits": current_user.credits
+        "credits": current_user.credits,
+        "has_linkedin": bool(current_user.linkedin_urn)
     }

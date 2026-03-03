@@ -26,6 +26,7 @@ class Token(BaseModel):
 
 class BriefingIn(BaseModel):
     company_name: str
+    owner_name: str = ""
     niche: str
     audience: str
     offer: str
@@ -33,6 +34,20 @@ class BriefingIn(BaseModel):
     tone: str = "Profissional, direto, claro"
     competitors: Optional[str] = ""
     goals: str = "Aumentar autoridade e ser citado por IA"
+    
+    # NOVOS CAMPOS PARA O ROBÔ LER NO PROMPT DE CONSTRUÇÃO
+    real_differentials: Optional[str] = ""
+    restrictions: Optional[str] = ""
+    forbidden_content: Optional[str] = ""
+    reviews: Optional[str] = ""
+    testimonials: Optional[str] = ""
+    usable_links_texts: Optional[str] = ""
+    site: Optional[str] = ""
+    instagram: Optional[str] = ""
+    google_business_profile: Optional[str] = ""
+    linkedin: Optional[str] = ""
+    youtube: Optional[str] = ""
+    tiktok: Optional[str] = ""
 
 class RobotOut(BaseModel):
     public_id: str

@@ -656,6 +656,26 @@ def authority_agents_get_run(run_id: int, client_id: str, session: Session = Dep
         "output_text": run.output_text,
         "created_at": run.created_at.isoformat(),
     }
+@app.patch("/api/authority-agents/run/{run_id}", response_model=AuthorityAgentRunOut)
+def authority_agents_update_run(run_id: int, payload: dict, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    run = session.get(AuthorityAgentRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Execução não encontrada.")
+    if run.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Acesso negado para esta execução.")
+    
+    if "output_text" in payload:
+        run.output_text = payload["output_text"]
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+
+    return {
+        "id": run.id,
+        "agent_key": run.agent_key,
+        "output_text": run.output_text,
+        "created_at": run.created_at.isoformat(),
+    }
 
 @app.post("/api/authority-agents/run", response_model=AuthorityAgentRunOut)
 def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):

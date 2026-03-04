@@ -433,7 +433,7 @@ def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
 
     nucleus = nucleus or {}
     requested_task = nucleus.get("requested_task") or nucleus.get("task") or None
-    selected_theme = nucleus.get("selected_theme") or None # Captura o tema escolhido pelo usuário
+    selected_theme = nucleus.get("selected_theme") or None 
 
     instructions = agent["instructions"]
     if requested_task:
@@ -444,6 +444,48 @@ def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
     # INJEÇÃO ESTRATÉGICA DO TEMA ESCOLHIDO
     if selected_theme:
         instructions += f"\n\nIMPORTANTE: O usuário definiu um tema/assunto específico para esta tarefa. Você DEVE focar o conteúdo EXCLUSIVAMENTE neste tema: '{selected_theme}'. Ajuste a entrega para girar em torno deste tema específico ignorando instruções genéricas de criar múltiplos assuntos que fujam desse foco."
+
+    # INJEÇÃO DA ARQUITETURA DE BLOCOS JSON (A Magia do Caminho 2)
+    json_instruction = """
+    \n\n=== REGRA DE SAÍDA OBRIGATÓRIA (ARQUITETURA DE BLOCOS) ===
+    Você DEVE retornar ÚNICA E EXCLUSIVAMENTE um objeto JSON válido. Não adicione marcações Markdown como ```json antes ou depois, apenas o JSON puro.
+    A estrutura do JSON deve seguir o formato de "blocos de interface" para que o frontend possa renderizar de forma visual e modular.
+    
+    Formato OBRIGATÓRIO (A raiz deve ter 'titulo_da_tela' e 'blocos'):
+    {
+      "titulo_da_tela": "Título principal do conteúdo gerado",
+      "blocos": [
+        {
+          "tipo": "markdown",
+          "conteudo": { "texto": "Conteúdo em texto longo, usando markdown para negritos, H3, H4 e listas (Ideal para textos explicativos e artigos)." }
+        },
+        {
+          "tipo": "highlight",
+          "conteudo": { "titulo": "Atenção / Dica de Ouro", "texto": "Mensagem curta de alto impacto, insight ou alerta.", "icone": "lightbulb" }
+        },
+        {
+          "tipo": "timeline",
+          "conteudo": { "passos": ["1. Primeiro faça isso", "2. Depois isso", "3. Finalize assim"] }
+        },
+        {
+          "tipo": "quote",
+          "conteudo": { "autor": "Nome do Cliente ou Empresa (Opcional)", "texto": "Depoimento, prova social ou citação forte" }
+        },
+        {
+          "tipo": "faq",
+          "conteudo": { "perguntas": [{"pergunta": "Qual o prazo?", "resposta": "O prazo é X."}] }
+        }
+      ]
+    }
+    
+    REGRAS DE USO DOS BLOCOS:
+    1. Escolha os tipos de blocos que melhor se adaptam à tarefa solicitada pelo agente.
+    2. Você pode repetir tipos de blocos (ex: vários blocos 'markdown' intercalados com blocos 'highlight' ou 'faq').
+    3. O tipo de ícone no highlight pode ser: "lightbulb", "alert", "check" ou "star".
+    4. Cumpra a missão original do agente organizando a resposta dentros desses blocos modulares.
+    5. NUNCA DEVOLVA TEXTO FORA DESTE JSON. O SAÍDA INTEIRA DEVE SER PROCESSÁVEL POR JSON.PARSE().
+    """
+    instructions += json_instruction
 
     payload = {
         "agent": {
@@ -467,19 +509,17 @@ def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
         ],
         temperature=0.5,
         max_tokens=4000,
+        response_format={"type": "json_object"} # FORÇA a API a garantir que o output seja JSON 100% válido
     )
-    return (resp.choices[0].message.content or "").strip()
-
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
-        ],
-        temperature=0.5,
-        max_tokens=4000,
-    )
-    return (resp.choices[0].message.content or "").strip()
+    
+    text = (resp.choices[0].message.content or "").strip()
+    
+    # Prevenção: Limpar crases de markdown se o modelo ignorar e ainda assim enviar
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text.replace("json", "", 1).strip()
+        
+    return text
 
 def suggest_themes_for_task(agent_key: str, nucleus: dict, task: str) -> list[str]:
     _require_key()

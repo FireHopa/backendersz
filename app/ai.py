@@ -433,12 +433,17 @@ def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
 
     nucleus = nucleus or {}
     requested_task = nucleus.get("requested_task") or nucleus.get("task") or None
+    selected_theme = nucleus.get("selected_theme") or None # Captura o tema escolhido pelo usuário
 
     instructions = agent["instructions"]
     if requested_task:
         task_prompt = find_task_prompt(agent_key, str(requested_task))
         if task_prompt:
             instructions = f"{instructions}\n\nTAREFA ESPECÍFICA (execute exatamente):\n{task_prompt}"
+
+    # INJEÇÃO ESTRATÉGICA DO TEMA ESCOLHIDO
+    if selected_theme:
+        instructions += f"\n\nIMPORTANTE: O usuário definiu um tema/assunto específico para esta tarefa. Você DEVE focar o conteúdo EXCLUSIVAMENTE neste tema: '{selected_theme}'. Ajuste a entrega para girar em torno deste tema específico ignorando instruções genéricas de criar múltiplos assuntos que fujam desse foco."
 
     payload = {
         "agent": {
@@ -453,6 +458,17 @@ def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
             "if_missing_data": "use exatamente 'não informado'",
         },
     }
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+        ],
+        temperature=0.5,
+        max_tokens=4000,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,

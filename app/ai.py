@@ -523,51 +523,103 @@ def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
 def suggest_themes_for_task(agent_key: str, nucleus: dict, task: str) -> list[str]:
     _require_key()
     
-    prompt = f"""
-    Você é um estrategista de conteúdo especialista em SEO, AEO e GEO.
-    O usuário pediu para executar a tarefa: "{task}".
-    
-    Baseando-se EXCLUSIVAMENTE nas informações do núcleo da empresa abaixo, sugira exatamente 5 temas ou tópicos de conteúdo que façam sentido para essa empresa.
-    Seja criativo mas extremamente focado na área de atuação, serviços e público-alvo informados. Os temas devem ser voltados a quebrar objeções e ajudar o cliente a decidir pela compra.
-    
-    Núcleo da Empresa:
-    {json.dumps(nucleus, ensure_ascii=False)}
-    
-    Retorne APENAS um JSON válido no formato abaixo, sem formatação markdown:
-    {{
-      "themes": [
-        "Sugestão de Tema 1",
-        "Sugestão de Tema 2",
-        "Sugestão de Tema 3",
-        "Sugestão de Tema 4",
-        "Sugestão de Tema 5"
-      ]
-    }}
-    """
+    prompt = f"""Você é um estrategista de conteúdo sênior, especialista em marketing de performance, conteúdo de conversão, psicologia de decisão, posicionamento digital e inteligência de mercado.
+Sua missão é executar com profundidade a seguinte tarefa:
+
+"{task}"
+Você deve se basear EXCLUSIVAMENTE nas informações do núcleo da empresa abaixo, sem inventar contexto externo, sem criar promessas desconectadas da realidade do negócio e sem responder com ideias genéricas.
+Núcleo da Empresa:
+
+{json.dumps(nucleus, ensure_ascii=False)}
+
+Seu trabalho não é apenas sugerir temas. Seu trabalho é identificar os temas com maior potencial estratégico de impacto, atenção, desejo, autoridade e conversão, de acordo com a natureza da tarefa.
+Antes de gerar os temas finais, siga obrigatoriamente este ROTEAMENTO DINÂMICO DE RACIOCÍNIO.
+
+PASSO 1: CLASSIFICAÇÃO E LEITURA DA INTENÇÃO DA TAREFA
+Analise a tarefa "{task}" e identifique com precisão qual é o objetivo principal do conteúdo.
+Classifique em apenas 1 tipo principal:
+
+TIPO 1. Retenção / Descoberta:
+Conteúdos para redes sociais, Reels, TikTok, Shorts, vídeos rápidos, roteiros virais, posts com alto poder de atenção.
+Objetivo central: interromper o scroll, gerar identificação imediata, retenção e compartilhamento.
+
+TIPO 2. Conversão / Decisão:
+Conteúdos para FAQ, dúvidas frequentes, quebra de objeções, comparativos, argumentos de compra, segurança para decidir.
+Objetivo central: reduzir fricção, vencer desconfiança, gerar clareza e facilitar a decisão.
+
+TIPO 3. Autoridade / Institucional:
+Conteúdos para artigos, LinkedIn, PR, posicionamento de especialista, cases, visão de mercado, metodologia própria.
+Objetivo central: construir reputação, percepção de valor, diferenciação e credibilidade.
+
+Regras do Passo 1:
+Explique brevemente por que a tarefa pertence ao tipo escolhido.
+
+PASSO 2: LEITURA ESTRATÉGICA DO NÚCLEO DA EMPRESA
+Antes de pensar nos temas, extraia mentalmente do núcleo da empresa: Oferta principal, Público-alvo, Dores, Desejos, Transformação, Consciência e Diferenciais.
+
+PASSO 3: APLICAÇÃO DO FRAMEWORK CORRETO
+- SE TIPO 1: Use o framework SKYSCAPER (emoções, curiosidade, formatos de gancho fortes).
+- SE TIPO 2: Use o framework MAPEAMENTO DE OBJEÇÕES (5 maiores dúvidas reais, riscos percebidos, segurança).
+- SE TIPO 3: Use o framework POSICIONAMENTO ESPECIALISTA (jargões, debates de mercado, autoridade).
+
+PASSO 4: FILTRO DE QUALIDADE ABSOLUTA
+Cada sugestão deve ser específica, fugir de títulos vazios ("dicas sobre..."), não ser genérica e soar como conteúdo de um estrategista sênior.
+
+PASSO 5: GERAÇÃO E CONDENSAÇÃO DE INTERFACE (CRÍTICO)
+Para manter o layout da interface limpo, você deve separar o seu raciocínio da entrega visual:
+1. No campo 'passo_5_detalhamento_interno', você vai escrever os 5 temas de forma longa (detalhando foco, recorte e ângulo).
+2. No array 'themes', você DEVE RESUMIR EXTREMAMENTE o título. O texto de cada item no array deve ter MÁXIMO DE 10 PALAVRAS ou 70 CARACTERES. 
+Não use o prefixo "Tema 1:". Entregue apenas o título magnético e o foco em 2 palavras. Exemplo: "O Erro que Trava Suas Vendas | Foco: Erro".
+
+FORMATO DE SAÍDA
+Retorne ÚNICA E EXCLUSIVAMENTE um JSON válido, sem markdown, sem comentários. Formato obrigatório:
+
+{{
+"passo_1_classificacao": "Explicação do tipo principal da tarefa.",
+"passo_2_leitura_estrategica_nucleo": "Leitura do núcleo da empresa.",
+"passo_3_aplicacao_framework": "Análise profunda usando o framework correspondente.",
+"passo_4_filtro_qualidade": "Critérios usados para eliminar ideias genéricas.",
+"passo_5_detalhamento_interno": "Rascunho longo dos 5 temas com seus respectivos títulos completos, recortes e justificativas.",
+"themes": [
+"[Título Ultra Curto, máx 8 palavras] | Foco: [1 palavra]",
+"[Título Ultra Curto, máx 8 palavras] | Foco: [1 palavra]",
+"[Título Ultra Curto, máx 8 palavras] | Foco: [1 palavra]",
+"[Título Ultra Curto, máx 8 palavras] | Foco: [1 palavra]",
+"[Título Ultra Curto, máx 8 palavras] | Foco: [1 palavra]"
+]
+}}
+
+REGRAS FINAIS INEGOCIÁVEIS
+- O array "themes" DEVE SER CURTO E DIRETO PARA CABER NUM BOTÃO. NADA DE TEXTOS LONGOS.
+- Não invente informações.
+- Não use linguagem genérica ou títulos frios.
+"""
     
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
-            temperature=0.7
+            temperature=0.7,
+            max_tokens=3000
         )
         
         text = (resp.choices[0].message.content or "").strip()
         data = json.loads(text)
+        
         return data.get("themes", [
-            "Os 5 principais mitos do nosso serviço",
-            "Como funciona o nosso processo passo a passo",
-            "Respondendo as dúvidas mais comuns dos nossos clientes",
-            "Estudo de caso: Como resolvemos o problema",
-            "O que você precisa saber antes de contratar"
+            "Os 5 mitos do nosso serviço | Foco: Mitos",
+            "Nosso processo passo a passo | Foco: Clareza",
+            "Respondendo as dúvidas comuns | Foco: FAQ",
+            "Estudo de caso de sucesso | Foco: Autoridade",
+            "O que saber antes de comprar | Foco: Segurança"
         ])
     except Exception as e:
-        print("Erro ao gerar temas:", e)
+        print("Erro ao gerar temas com o framework de estrategista sênior:", e)
         return [
-            "Por que escolher o nosso serviço?",
-            "Como funciona o nosso atendimento",
-            "Dúvidas frequentes de novos clientes",
-            "Os maiores erros antes de contratar um profissional",
-            "Tudo que está incluso na nossa entrega"
+            "Por que nos escolher? | Foco: Diferencial",
+            "Como funciona o atendimento | Foco: Processo",
+            "Dúvidas de novos clientes | Foco: FAQ",
+            "Maiores erros ao contratar | Foco: Alerta",
+            "Tudo incluso na entrega | Foco: Valor"
         ]

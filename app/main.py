@@ -110,10 +110,6 @@ app.add_middleware(
 def _startup():
     init_db()
 
-@app.get("/api/health")
-def health():
-    return {"ok": True, "ts": datetime.utcnow().isoformat()}
-
 def _get_robot_or_404(public_id: str, session: Session, current_user: User) -> Robot:
     if public_id == "business-core-global":
         robot = session.exec(select(Robot).where(Robot.public_id == public_id)).first()
@@ -656,6 +652,7 @@ def authority_agents_get_run(run_id: int, client_id: str, session: Session = Dep
         "output_text": run.output_text,
         "created_at": run.created_at.isoformat(),
     }
+
 @app.patch("/api/authority-agents/run/{run_id}", response_model=AuthorityAgentRunOut)
 def authority_agents_update_run(run_id: int, payload: dict, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     run = session.get(AuthorityAgentRun, run_id)
@@ -846,9 +843,19 @@ def delete_business_core_file(public_id: str, filename: str, session: Session = 
 
 @app.post("/api/authority-agents/suggest-themes")
 def authority_agents_suggest_themes(payload: SuggestThemesRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    # NOVA REGRA: Desconta 2 créditos quando pede sugestão de temas
+    if current_user.credits < 2:
+        raise HTTPException(status_code=403, detail="Créditos insuficientes. Precisas de 2 créditos para gerar temas com IA.")
+        
     from .ai import suggest_themes_for_task
     try:
         themes = suggest_themes_for_task(payload.agent_key, payload.nucleus, payload.task)
+        
+        # Desconta do banco de dados do utilizador
+        current_user.credits -= 2
+        session.add(current_user)
+        session.commit()
+        
         return {"themes": themes}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

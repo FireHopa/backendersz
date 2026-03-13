@@ -7,7 +7,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -37,6 +37,12 @@ class ImageEngineRequest(BaseModel):
     headline: str = ""
     subheadline: str = ""
     descricao_visual: str = ""
+
+class ImageEditRequest(BaseModel):
+    formato: str = Field(..., description="quadrado_1_1, vertical_9_16 ou horizontal_16_9")
+    qualidade: str = Field(..., description="baixa, media ou alta")
+    instrucoes_edicao: str = ""
+
 
 
 def _sse(data: Dict[str, Any]) -> str:
@@ -194,6 +200,81 @@ def _build_user_brief(payload: ImageEngineRequest) -> str:
         parts.append(f"Descrição visual da arte: {payload.descricao_visual.strip()}")
 
     return "\n".join(parts)
+
+def _build_user_edit_brief(payload: ImageEditRequest) -> str:
+    parts = [
+        f"Formato: {payload.formato}",
+        f"Qualidade desejada: {payload.qualidade}",
+    ]
+
+    if payload.instrucoes_edicao.strip():
+        parts.append(f"Instruções de edição: {payload.instrucoes_edicao.strip()}")
+
+    return "\n".join(parts)
+
+def _guess_image_content_type(filename: str, upload_content_type: Optional[str] = None) -> str:
+    allowed = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+    if upload_content_type in allowed:
+        return "image/jpeg" if upload_content_type == "image/jpg" else upload_content_type
+
+    name = (filename or "").lower()
+    if name.endswith(".png"):
+        return "image/png"
+    if name.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _validate_reference_image(image_bytes: bytes, content_type: str) -> None:
+    allowed = {"image/png", "image/jpeg", "image/webp"}
+    if content_type not in allowed:
+        raise ValueError("Formato inválido. Use PNG, JPG, JPEG ou WEBP.")
+
+    if not image_bytes:
+        raise ValueError("A imagem de referência está vazia.")
+
+    if len(image_bytes) > 20 * 1024 * 1024:
+        raise ValueError("A imagem de referência excede 20 MB.")
+
+
+async def _post_multipart_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Dict[str, str],
+    data: Dict[str, Any],
+    files: List[tuple],
+    retries: int = 3,
+    backoff_base: float = 1.2,
+) -> httpx.Response:
+    last_exc = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            resp = await client.post(url, headers=headers, data=data, files=files)
+            if resp.status_code < 400:
+                return resp
+
+            if resp.status_code not in (429, 500, 502, 503, 504):
+                raise httpx.HTTPStatusError(
+                    f"HTTP {resp.status_code}: {resp.text}",
+                    request=resp.request,
+                    response=resp,
+                )
+
+            last_exc = httpx.HTTPStatusError(
+                f"HTTP {resp.status_code}: {resp.text}",
+                request=resp.request,
+                response=resp,
+            )
+
+        except Exception as e:
+            last_exc = e
+
+        if attempt < retries:
+            await asyncio.sleep(backoff_base * attempt)
+
+    raise last_exc if last_exc else RuntimeError("Falha desconhecida em _post_multipart_with_retry")
+
 
 
 async def _post_json_with_retry(
@@ -725,6 +806,220 @@ async def _generate_google_best_available(
     raise ValueError(" | ".join(errors))
 
 
+
+async def _improve_edit_prompt_with_openai(
+    client: httpx.AsyncClient,
+    payload: ImageEditRequest,
+    aspect_ratio: str,
+    openai_key: str,
+) -> Dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {openai_key}",
+        "Content-Type": "application/json",
+    }
+
+    instrucoes_edicao = _sanitize_copy(payload.instrucoes_edicao, 2600)
+
+    system_text = """
+Você é um diretor de arte sênior de pós-produção e engenheiro de prompts para edição de imagens com referência.
+
+Sua função é escrever um prompt de edição extremamente preciso para uma imagem já existente.
+A prioridade não é reinventar a peça. A prioridade é preservar o original e modificar somente o que foi pedido.
+
+Retorne SOMENTE JSON válido com esta estrutura exata:
+{
+  "prompt_final": string,
+  "negative_prompt": string,
+  "creative_direction": string,
+  "layout_notes": string,
+  "preservation_rules": string,
+  "edit_strategy": string,
+  "micro_detail_rules": string,
+  "consistency_rules": string
+}
+
+Regras obrigatórias:
+1. Escreva TUDO em português do Brasil.
+2. Trate a imagem enviada como base dominante e autoritativa.
+3. Preservar tudo o que não foi explicitamente pedido para mudar.
+4. A edição deve ser local e precisa, evitando reconstrução total da peça.
+5. Se houver logos, selos, ícones, marcas, tipografias pequenas, estampas, embalagens, assinaturas visuais ou detalhes delicados, priorize preservar exatamente o que já existe em vez de redesenhar, reinterpretar ou recriar.
+6. Não substituir logos pequenos por versões novas, aproximadas ou genéricas.
+7. Não inventar elementos de branding, não redesenhar marcas e não trocar símbolos existentes por versões parecidas.
+8. Se algum detalhe pequeno não precisar mudar, ele deve permanecer visualmente consistente com a referência original.
+9. O negative_prompt deve bloquear: recriação completa da cena, redesenho de logos, troca de marca, texto aleatório, texto em inglês, duplicações, deformações, mudanças arbitrárias no produto, mudanças desnecessárias no enquadramento, alterações indevidas de cor da marca, remoção de detalhes importantes, blur, baixa nitidez e aparência genérica de IA.
+10. preservation_rules deve reforçar a preservação de identidade visual, branding, embalagem, produto, personagem, enquadramento, perspectiva, materiais e microdetalhes sempre que isso não conflitar com o pedido.
+11. edit_strategy deve descrever edição pontual, incremental e controlada, nunca recriação ampla sem necessidade.
+12. micro_detail_rules deve explicar como proteger logos, textos pequenos, selos, ícones, botões, acabamentos, costuras, rótulos e elementos gráficos finos.
+13. consistency_rules deve explicar como manter coerência entre fundo, foco principal, sombras, reflexos, perspectiva e proporções.
+14. O resultado precisa ser mais técnico, mais restritivo e mais útil para edição real do que um prompt comum.
+"""
+
+    user_text = (
+        f"Briefing estruturado para edição:\n{_build_user_edit_brief(payload)}\n\n"
+        f"Aspect ratio de saída: {aspect_ratio}\n\n"
+        f"Instruções do usuário: {instrucoes_edicao or 'não informadas'}\n\n"
+        "Quero um refinamento com foco em edição fiel, intervenção precisa, preservação de branding e proteção máxima de logos pequenos e detalhes sensíveis."
+    )
+
+    payload_json = {
+        "model": OPENAI_CHAT_MODEL,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": 0.1,
+    }
+
+    resp = await _post_json_with_retry(
+        client=client,
+        url="https://api.openai.com/v1/chat/completions",
+        headers=headers,
+        json_payload=payload_json,
+        retries=3,
+    )
+
+    content = resp.json()["choices"][0]["message"]["content"]
+    data = _parse_json_safe(content)
+
+    return {
+        "prompt_final": _clamp_text(data.get("prompt_final", "")),
+        "negative_prompt": _clamp_text(data.get("negative_prompt", "")),
+        "creative_direction": _clamp_text(data.get("creative_direction", "edição precisa com preservação máxima da base original")),
+        "layout_notes": _clamp_text(data.get("layout_notes", "preservar enquadramento e composição geral, mudando somente o que foi solicitado")),
+        "preservation_rules": _clamp_text(data.get("preservation_rules", "preservar identidade visual, branding, embalagem, detalhes finos, logos e materiais originais sempre que não houver pedido explícito de alteração")),
+        "edit_strategy": _clamp_text(data.get("edit_strategy", "aplicar edição localizada, incremental e controlada, sem recriar a peça inteira")),
+        "micro_detail_rules": _clamp_text(data.get("micro_detail_rules", "não redesenhar logos pequenos, selos, ícones, rótulos ou detalhes gráficos finos; reaproveitar visualmente o que já existe na referência sempre que possível")),
+        "consistency_rules": _clamp_text(data.get("consistency_rules", "manter coerência de perspectiva, escala, luz, sombras, reflexos, nitidez e cor entre os elementos preservados e os editados")),
+    }
+
+def _build_final_edit_prompt(
+    payload: ImageEditRequest,
+    aspect_ratio: str,
+    improved: Dict[str, str],
+) -> str:
+    instructions = _sanitize_copy(payload.instrucoes_edicao, 3400)
+
+    final_prompt = f"""
+{improved['prompt_final']}
+
+Esta tarefa é uma EDIÇÃO de imagem baseada em referência.
+Use a imagem enviada como base principal e dominante da composição.
+Preserve tudo o que não foi explicitamente pedido para mudar.
+Não recriar a peça inteira.
+Não reinterpretar a marca.
+Não redesenhar detalhes pequenos sem necessidade.
+
+Objetivo principal:
+- editar a imagem com precisão
+- preservar o máximo possível do original
+- alterar apenas os pontos necessários para cumprir o briefing
+- manter acabamento premium e coerência visual
+- evitar qualquer reconstrução desnecessária de logos, marcas, selos, ícones, embalagens e detalhes sensíveis
+
+Contexto estruturado da edição:
+- formato selecionado: {payload.formato}
+- proporção final: {aspect_ratio}
+- nível de qualidade solicitado: {_quality_label(_normalize_quality(payload.qualidade))}
+- instruções de edição: {instructions or 'seguir a imagem de referência e editar somente o necessário'}
+
+Direção criativa:
+{improved['creative_direction']}
+
+Notas de layout:
+{improved['layout_notes']}
+
+Regras de preservação:
+{improved['preservation_rules']}
+
+Estratégia de edição:
+{improved['edit_strategy']}
+
+Proteção de microdetalhes:
+{improved['micro_detail_rules']}
+
+Regras de consistência:
+{improved['consistency_rules']}
+
+Regras técnicas obrigatórias:
+- tratar a imagem enviada como referência dominante
+- modificar somente o que foi solicitado nas instruções
+- manter enquadramento, perspectiva e proporção sempre que possível
+- preservar identidade visual, produto, embalagem, materiais e estrutura original
+- preservar exatamente logos, marcas, selos, ícones, assinaturas visuais e detalhes pequenos que não precisem ser alterados
+- não substituir logos pequenos por versões novas, aproximadas, borradas ou genéricas
+- não inventar branding novo
+- não simplificar elementos pequenos importantes
+- não apagar detalhes finos relevantes
+- se houver intervenção próxima a uma logo ou detalhe delicado, manter forma, posição relativa, nitidez e leitura consistentes com a referência
+- manter sombras, reflexos, contraste, textura e iluminação coerentes com a base original
+- evitar deformações, duplicações, desalinhamentos, artefatos e aparência genérica de IA
+- o resultado deve parecer a mesma peça refinada, e não outra peça recriada do zero
+
+Restrições fortes:
+- não recriar a cena inteira sem necessidade
+- não redesenhar ou trocar logos
+- não trocar marca, símbolo, selo ou rótulo existente por algo parecido
+- não mudar cores de branding sem pedido explícito
+- não adicionar texto aleatório
+- não inserir texto em inglês
+- não poluir o layout
+"""
+    return _clamp_text(final_prompt, 7000)
+
+
+async def _edit_openai_image(
+    client: httpx.AsyncClient,
+    image_bytes: bytes,
+    filename: str,
+    content_type: str,
+    final_prompt: str,
+    aspect_ratio: str,
+    quality: str,
+    openai_key: str,
+) -> Dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {openai_key}",
+    }
+
+    data = {
+        "model": OPENAI_IMAGE_MODEL,
+        "prompt": final_prompt,
+        "size": _openai_size_from_aspect_ratio(aspect_ratio),
+        "quality": quality,
+        "output_format": "png",
+    }
+
+    files = [
+        ("image[]", (filename or "reference.png", image_bytes, content_type)),
+    ]
+
+    resp = await _post_multipart_with_retry(
+        client=client,
+        url="https://api.openai.com/v1/images/edits",
+        headers=headers,
+        data=data,
+        files=files,
+        retries=3,
+    )
+
+    body = resp.json()
+    data_items = body.get("data", [])
+    if not data_items:
+        raise ValueError(f"OpenAI edit sem data: {body}")
+
+    first = data_items[0]
+    b64_json = first.get("b64_json")
+    if not b64_json:
+        raise ValueError(f"OpenAI edit não retornou b64_json: {body}")
+
+    return {
+        "engine_id": "openai_edit",
+        "motor": "OpenAI GPT Image 1.5 Edit",
+        "url": _data_uri_from_b64(b64_json, "image/png"),
+        "raw": body,
+    }
 @router.post("/api/image-engine/stream")
 async def image_engine_stream(body: ImageEngineRequest, current_user: User = Depends(get_current_user)):
     openai_key = os.getenv("OPENAI_API_KEY")
@@ -747,8 +1042,6 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
         try:
             aspect_ratio = _normalize_aspect_ratio(body.formato)
             openai_quality = _normalize_quality(body.qualidade)
-            asset_type = _asset_type_from_context(body.onde_postar, aspect_ratio)
-            preset = _marketing_preset(asset_type, body.onde_postar)
 
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
                 yield _sse({
@@ -756,9 +1049,7 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
                     "progress": 12,
                     "meta": {
                         "aspect_ratio": aspect_ratio,
-                        "asset_type": asset_type,
                         "quality": openai_quality,
-                        "post_destination": body.onde_postar,
                     },
                 })
 
@@ -788,12 +1079,9 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
                     "layout_notes": improved["layout_notes"],
                     "overlay_recommendation": improved["overlay_recommendation"],
                     "grid_spec": improved["grid_spec"],
-                    "text_distribution_rules": improved["text_distribution_rules"],
-                    "copy_policy": improved["copy_policy"],
                     "final_prompt": final_prompt,
                     "aspect_ratio": aspect_ratio,
                     "quality": openai_quality,
-                    "asset_type": asset_type,
                 })
 
                 tasks = [
@@ -873,8 +1161,6 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
                     "layout_notes": improved["layout_notes"],
                     "overlay_recommendation": improved["overlay_recommendation"],
                     "grid_spec": improved["grid_spec"],
-                    "text_distribution_rules": improved["text_distribution_rules"],
-                    "copy_policy": improved["copy_policy"],
                     "final_prompt": final_prompt,
                     "final_results": [
                         {
@@ -889,6 +1175,138 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
 
         except Exception as e:
             yield _sse({"error": f"Erro interno no motor: {str(e)}"})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/api/image-engine/edit/stream")
+async def image_engine_edit_stream(
+    reference_image: UploadFile = File(...),
+    formato: str = Form(...),
+    qualidade: str = Form(...),
+    instrucoes_edicao: str = Form(...),
+    current_user: User = Depends(get_current_user),
+):
+    del current_user
+
+    openai_key = os.getenv("OPENAI_API_KEY")
+
+    image_bytes = await reference_image.read()
+    image_filename = reference_image.filename or "reference.png"
+    image_content_type = _guess_image_content_type(image_filename, reference_image.content_type)
+
+    body = ImageEditRequest(
+        formato=formato,
+        qualidade=qualidade,
+        instrucoes_edicao=instrucoes_edicao,
+    )
+
+    async def event_generator():
+        if not openai_key:
+            yield _sse({"error": "OPENAI_API_KEY não configurada."})
+            return
+
+        try:
+            _validate_reference_image(image_bytes, image_content_type)
+
+            if not body.instrucoes_edicao.strip():
+                raise ValueError("As instruções de edição são obrigatórias.")
+
+            aspect_ratio = _normalize_aspect_ratio(body.formato)
+            openai_quality = _normalize_quality(body.qualidade)
+
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+                yield _sse({
+                    "status": "Analisando a imagem de referência e refinando o prompt de edição...",
+                    "progress": 14,
+                    "meta": {
+                        "aspect_ratio": aspect_ratio,
+                        "quality": openai_quality,
+                        "reference_filename": image_filename,
+                    },
+                })
+
+                improved = await _improve_edit_prompt_with_openai(
+                    client=client,
+                    payload=body,
+                    aspect_ratio=aspect_ratio,
+                    openai_key=openai_key,
+                )
+
+                final_prompt = _build_final_edit_prompt(
+                    payload=body,
+                    aspect_ratio=aspect_ratio,
+                    improved=improved,
+                )
+
+                yield _sse({
+                    "status": "Prompt refinado. Enviando a imagem de referência para edição final.",
+                    "progress": 46,
+                    "improved_prompt": improved["prompt_final"],
+                    "negative_prompt": improved["negative_prompt"],
+                    "creative_direction": improved["creative_direction"],
+                    "layout_notes": improved["layout_notes"],
+                    "preservation_rules": improved["preservation_rules"],
+                    "edit_strategy": improved["edit_strategy"],
+                    "micro_detail_rules": improved["micro_detail_rules"],
+                    "consistency_rules": improved["consistency_rules"],
+                    "final_prompt": final_prompt,
+                    "aspect_ratio": aspect_ratio,
+                    "quality": openai_quality,
+                })
+
+                result = await _edit_openai_image(
+                    client=client,
+                    image_bytes=image_bytes,
+                    filename=image_filename,
+                    content_type=image_content_type,
+                    final_prompt=final_prompt,
+                    aspect_ratio=aspect_ratio,
+                    quality=openai_quality,
+                    openai_key=openai_key,
+                )
+
+                yield _sse({
+                    "status": f"Edição concluída com sucesso em {result['motor']}.",
+                    "progress": 82,
+                    "partial_result": {
+                        "engine_id": result["engine_id"],
+                        "motor": result["motor"],
+                        "url": result["url"],
+                    },
+                })
+
+                yield _sse({
+                    "status": "Concluído. Entregando a imagem editada.",
+                    "progress": 100,
+                    "improved_prompt": improved["prompt_final"],
+                    "negative_prompt": improved["negative_prompt"],
+                    "creative_direction": improved["creative_direction"],
+                    "layout_notes": improved["layout_notes"],
+                    "preservation_rules": improved["preservation_rules"],
+                    "edit_strategy": improved["edit_strategy"],
+                    "micro_detail_rules": improved["micro_detail_rules"],
+                    "consistency_rules": improved["consistency_rules"],
+                    "final_prompt": final_prompt,
+                    "final_results": [
+                        {
+                            "engine_id": result["engine_id"],
+                            "motor": result["motor"],
+                            "url": result["url"],
+                        }
+                    ],
+                })
+
+        except Exception as e:
+            yield _sse({"error": f"Erro interno no editor: {str(e)}"})
 
     return StreamingResponse(
         event_generator(),

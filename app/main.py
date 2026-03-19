@@ -998,6 +998,24 @@ async def publish_linkedin(payload: dict, session: Session = Depends(get_session
 
     return {"ok": True}
 
-from .image_engine import router as image_engine_router
+# ==========================================
+# ROTAS ADICIONAIS (IMAGE ENGINE & INSTAGRAM)
+# ==========================================
 
+from .image_engine import router as image_engine_router
 app.include_router(image_engine_router)
+
+from .instagram import router as instagram_router
+app.include_router(instagram_router)
+
+from .facebook import router as facebook_router
+app.include_router(facebook_router)
+
+from .youtube import router as youtube_router
+app.include_router(youtube_router)
+
+from .tiktok import router as tiktok_router
+app.include_router(tiktok_router)
+
+from .google_business_profile import router as google_business_router
+app.include_router(google_business_router)

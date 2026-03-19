@@ -23,6 +23,20 @@ class Token(BaseModel):
     user_email: str
     credits: int = 100
     has_linkedin: bool = False
+    has_instagram: bool = False
+    instagram_username: Optional[str] = None
+    has_facebook: bool = False
+    facebook_page_name: Optional[str] = None
+    facebook_page_username: Optional[str] = None
+    has_youtube: bool = False
+    youtube_channel_title: Optional[str] = None
+    youtube_channel_handle: Optional[str] = None
+    has_tiktok: bool = False
+    tiktok_display_name: Optional[str] = None
+    tiktok_username: Optional[str] = None
+    has_google_business_profile: bool = False
+    google_business_account_display_name: Optional[str] = None
+    google_business_location_title: Optional[str] = None
 # =====================================
 
 class BriefingIn(BaseModel):

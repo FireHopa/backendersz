@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from PIL import Image, ImageOps, ImageChops, UnidentifiedImageError
+
+from .image_local_edit import (
+    analyze_region_with_openai,
+    build_mask_from_analysis,
+    render_local_text_fallback,
+    should_use_localized_edit,
+)
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -32,18 +42,191 @@ HTTP_TIMEOUT = httpx.Timeout(connect=20.0, read=180.0, write=60.0, pool=60.0)
 class ImageEngineRequest(BaseModel):
     formato: str = Field(..., description="quadrado_1_1, vertical_9_16 ou horizontal_16_9")
     qualidade: str = Field(..., description="baixa, media ou alta")
-    onde_postar: str = Field(..., description="Destino principal da arte")
+    onde_postar: Optional[str] = Field(default=None, description="Campo legado ignorado")
     paleta_cores: str = Field(..., description="Paleta pronta ou personalizada")
     headline: str = ""
     subheadline: str = ""
     descricao_visual: str = ""
+    width: Optional[int] = Field(default=None, description="Largura final customizada em pixels")
+    height: Optional[int] = Field(default=None, description="Altura final customizada em pixels")
 
 class ImageEditRequest(BaseModel):
     formato: str = Field(..., description="quadrado_1_1, vertical_9_16 ou horizontal_16_9")
     qualidade: str = Field(..., description="baixa, media ou alta")
     instrucoes_edicao: str = ""
+    width: Optional[int] = Field(default=None, description="Largura final customizada em pixels")
+    height: Optional[int] = Field(default=None, description="Altura final customizada em pixels")
 
 
+
+
+SUPPORTED_BASE_SIZES: List[Tuple[int, int]] = [
+    (1024, 1024),
+    (1024, 1536),
+    (1536, 1024),
+]
+
+
+def _normalize_dimension_value(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("Width e height precisam ser números inteiros.")
+
+    if normalized < 256 or normalized > 4096:
+        raise ValueError("Width e height precisam estar entre 256 e 4096 pixels.")
+
+    return normalized
+
+
+def _resolve_target_dimensions(width: Optional[int], height: Optional[int]) -> Optional[Tuple[int, int]]:
+    normalized_width = _normalize_dimension_value(width)
+    normalized_height = _normalize_dimension_value(height)
+
+    if normalized_width is None and normalized_height is None:
+        return None
+
+    if normalized_width is None or normalized_height is None:
+        raise ValueError("Para usar tamanho customizado, informe width e height.")
+
+    return normalized_width, normalized_height
+
+
+def _base_size_to_aspect_ratio(width: int, height: int) -> str:
+    if width == height:
+        return "1:1"
+    if height > width:
+        return "9:16"
+    return "16:9"
+
+
+def _choose_best_supported_base_size(target_width: int, target_height: int) -> Tuple[int, int]:
+    best_size: Optional[Tuple[int, int]] = None
+    best_score: Optional[Tuple[float, float, int]] = None
+
+    for base_width, base_height in SUPPORTED_BASE_SIZES:
+        scale = max(target_width / base_width, target_height / base_height)
+        scaled_width = base_width * scale
+        scaled_height = base_height * scale
+        waste = (scaled_width * scaled_height) - (target_width * target_height)
+        orientation_penalty = 0
+        if (target_height > target_width and base_height < base_width) or (target_width > target_height and base_width < base_height):
+            orientation_penalty = 1
+        score = (orientation_penalty, waste, abs((base_width / base_height) - (target_width / target_height)))
+        if best_score is None or score < best_score:
+            best_score = score
+            best_size = (base_width, base_height)
+
+    return best_size or (1024, 1024)
+
+
+def _image_bytes_from_result_url(url: str) -> Tuple[bytes, str]:
+    if url.startswith("data:"):
+        header, b64_data = url.split(",", 1)
+        mime = header.split(";")[0].replace("data:", "") or "image/png"
+        return base64.b64decode(b64_data), mime
+    raise ValueError("Resultado externo precisa ser baixado antes do pós-processamento.")
+
+
+def _result_url_from_image_bytes(image_bytes: bytes, mime: str = "image/png") -> str:
+    return _data_uri_from_b64(base64.b64encode(image_bytes).decode("utf-8"), mime)
+
+
+
+
+def _trim_uniform_borders(image: Image.Image) -> Image.Image:
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+    if width < 8 or height < 8:
+        return rgba
+
+    corners = [
+        rgba.getpixel((0, 0)),
+        rgba.getpixel((width - 1, 0)),
+        rgba.getpixel((0, height - 1)),
+        rgba.getpixel((width - 1, height - 1)),
+    ]
+
+    base = corners[0]
+
+    def _similar(a, b, tolerance: int = 16) -> bool:
+        return all(abs(int(a[idx]) - int(b[idx])) <= tolerance for idx in range(4))
+
+    if sum(1 for corner in corners if _similar(corner, base)) < 3:
+        return rgba
+
+    background = Image.new("RGBA", rgba.size, base)
+    diff = ImageChops.difference(rgba, background)
+    bbox = diff.getbbox()
+    if not bbox:
+        return rgba
+
+    left, top, right, bottom = bbox
+    trimmed_width = right - left
+    trimmed_height = bottom - top
+
+    if trimmed_width <= 0 or trimmed_height <= 0:
+        return rgba
+
+    if left == 0 and top == 0 and right == width and bottom == height:
+        return rgba
+
+    if trimmed_width < width * 0.55 or trimmed_height < height * 0.55:
+        return rgba
+
+    return rgba.crop(bbox)
+
+def _resize_and_crop_image_bytes(image_bytes: bytes, target_width: int, target_height: int) -> bytes:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            prepared = img.convert("RGBA") if img.mode not in {"RGB", "RGBA"} else img.copy()
+            prepared = _trim_uniform_borders(prepared)
+            fitted = ImageOps.fit(
+                prepared,
+                (target_width, target_height),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            buffer = io.BytesIO()
+            fitted.save(buffer, format="PNG", optimize=True)
+            return buffer.getvalue()
+    except UnidentifiedImageError as exc:
+        raise ValueError(f"Não foi possível interpretar a imagem retornada para pós-processamento: {exc}")
+
+
+async def _apply_postprocess_if_needed(
+    client: httpx.AsyncClient,
+    result: Dict[str, Any],
+    target_dimensions: Optional[Tuple[int, int]],
+) -> Dict[str, Any]:
+    if not target_dimensions:
+        return result
+
+    target_width, target_height = target_dimensions
+    url = result.get("url")
+    if not url:
+        return result
+
+    if url.startswith("data:"):
+        source_bytes, _ = _image_bytes_from_result_url(url)
+    else:
+        response = await client.get(url)
+        response.raise_for_status()
+        source_bytes = response.content
+
+    processed_bytes = _resize_and_crop_image_bytes(source_bytes, target_width, target_height)
+    next_result = dict(result)
+    next_result["url"] = _result_url_from_image_bytes(processed_bytes, "image/png")
+    next_result["postprocessed"] = True
+    next_result["target_dimensions"] = {"width": target_width, "height": target_height}
+    next_result["motor"] = f"{result.get('motor', 'Imagem')} + Resize exato"
+    return next_result
+
+
+def _size_label(width: int, height: int) -> str:
+    return f"{width}x{height}"
 
 def _sse(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -185,10 +368,13 @@ def _sanitize_copy(text: str, max_len: int) -> str:
 def _build_user_brief(payload: ImageEngineRequest) -> str:
     parts = [
         f"Formato: {payload.formato}",
-        f"Onde vai ser postado: {payload.onde_postar}",
+        "Objetivo de publicação: livre, sem canal fixo",
         f"Qualidade desejada: {payload.qualidade}",
         f"Paleta de cores: {payload.paleta_cores}",
     ]
+
+    if payload.width and payload.height:
+        parts.append(f"Tamanho final customizado: {payload.width}x{payload.height}")
 
     if payload.headline.strip():
         parts.append(f"Headline exata: {payload.headline.strip()}")
@@ -206,6 +392,9 @@ def _build_user_edit_brief(payload: ImageEditRequest) -> str:
         f"Formato: {payload.formato}",
         f"Qualidade desejada: {payload.qualidade}",
     ]
+
+    if payload.width and payload.height:
+        parts.append(f"Tamanho final customizado: {payload.width}x{payload.height}")
 
     if payload.instrucoes_edicao.strip():
         parts.append(f"Instruções de edição: {payload.instrucoes_edicao.strip()}")
@@ -508,10 +697,11 @@ Contexto estruturado da peça:
 - formato selecionado: {payload.formato}
 - proporção final: {aspect_ratio}
 - tipo de peça: {asset_type}
-- destino de publicação: {payload.onde_postar}
+- destino de publicação: livre, sem canal fixo
 - nível de qualidade solicitado: {_quality_label(_normalize_quality(payload.qualidade))}
 - paleta de cores: {payload.paleta_cores}
 - descrição visual solicitada: {description or 'seguir uma direção comercial premium coerente com o briefing'}
+- tamanho final desejado: {_size_label(payload.width, payload.height) if payload.width and payload.height else 'usar o canvas padrão do formato selecionado'}
 
 Objetivo do preset:
 {preset['goal']}
@@ -581,6 +771,7 @@ async def _generate_openai_image(
     aspect_ratio: str,
     quality: str,
     openai_key: str,
+    openai_size: Optional[str] = None,
 ) -> Dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {openai_key}",
@@ -590,7 +781,7 @@ async def _generate_openai_image(
     payload = {
         "model": OPENAI_IMAGE_MODEL,
         "prompt": final_prompt,
-        "size": _openai_size_from_aspect_ratio(aspect_ratio),
+        "size": openai_size or _openai_size_from_aspect_ratio(aspect_ratio),
         "quality": quality,
         "output_format": "png",
         "background": "opaque",
@@ -923,6 +1114,7 @@ Contexto estruturado da edição:
 - proporção final: {aspect_ratio}
 - nível de qualidade solicitado: {_quality_label(_normalize_quality(payload.qualidade))}
 - instruções de edição: {instructions or 'seguir a imagem de referência e editar somente o necessário'}
+- tamanho final desejado: {_size_label(payload.width, payload.height) if payload.width and payload.height else 'usar o canvas padrão do formato selecionado'}
 
 Direção criativa:
 {improved['creative_direction']}
@@ -978,6 +1170,9 @@ async def _edit_openai_image(
     aspect_ratio: str,
     quality: str,
     openai_key: str,
+    openai_size: Optional[str] = None,
+    mask_bytes: Optional[bytes] = None,
+    input_fidelity: str = "high",
 ) -> Dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {openai_key}",
@@ -986,14 +1181,18 @@ async def _edit_openai_image(
     data = {
         "model": OPENAI_IMAGE_MODEL,
         "prompt": final_prompt,
-        "size": _openai_size_from_aspect_ratio(aspect_ratio),
+        "size": openai_size or _openai_size_from_aspect_ratio(aspect_ratio),
         "quality": quality,
         "output_format": "png",
+        "input_fidelity": input_fidelity,
+        "background": "opaque",
     }
 
     files = [
         ("image[]", (filename or "reference.png", image_bytes, content_type)),
     ]
+    if mask_bytes:
+        files.append(("mask", ("localized-mask.png", mask_bytes, "image/png")))
 
     resp = await _post_multipart_with_retry(
         client=client,
@@ -1040,23 +1239,39 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
             return
 
         try:
+            requested_dimensions = _resolve_target_dimensions(body.width, body.height)
             aspect_ratio = _normalize_aspect_ratio(body.formato)
             openai_quality = _normalize_quality(body.qualidade)
+
+            if requested_dimensions:
+                base_width, base_height = _choose_best_supported_base_size(*requested_dimensions)
+                engine_aspect_ratio = _base_size_to_aspect_ratio(base_width, base_height)
+                openai_size = f"{base_width}x{base_height}"
+            else:
+                engine_aspect_ratio = aspect_ratio
+                openai_size = _openai_size_from_aspect_ratio(engine_aspect_ratio)
+
+            asset_type = _asset_type_from_context(None, engine_aspect_ratio)
+            preset = _marketing_preset(asset_type, None)
 
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
                 yield _sse({
                     "status": "Analisando briefing e refinando o prompt com foco em direção de arte publicitária...",
                     "progress": 12,
                     "meta": {
-                        "aspect_ratio": aspect_ratio,
+                        "aspect_ratio": engine_aspect_ratio,
                         "quality": openai_quality,
+                        "asset_type": asset_type,
+                        "preset_mode": preset.get("mode"),
+                        "openai_size": openai_size,
+                        "target_dimensions": {"width": requested_dimensions[0], "height": requested_dimensions[1]} if requested_dimensions else None,
                     },
                 })
 
                 improved = await _improve_prompt_with_openai(
                     client=client,
                     payload=body,
-                    aspect_ratio=aspect_ratio,
+                    aspect_ratio=engine_aspect_ratio,
                     asset_type=asset_type,
                     preset=preset,
                     openai_key=openai_key,
@@ -1064,7 +1279,7 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
 
                 final_prompt = _build_final_generation_prompt(
                     payload=body,
-                    aspect_ratio=aspect_ratio,
+                    aspect_ratio=engine_aspect_ratio,
                     asset_type=asset_type,
                     preset=preset,
                     improved=improved,
@@ -1080,8 +1295,12 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
                     "overlay_recommendation": improved["overlay_recommendation"],
                     "grid_spec": improved["grid_spec"],
                     "final_prompt": final_prompt,
-                    "aspect_ratio": aspect_ratio,
+                    "aspect_ratio": engine_aspect_ratio,
                     "quality": openai_quality,
+                    "asset_type": asset_type,
+                    "preset_mode": preset.get("mode"),
+                    "openai_size": openai_size,
+                    "target_dimensions": {"width": requested_dimensions[0], "height": requested_dimensions[1]} if requested_dimensions else None,
                 })
 
                 tasks = [
@@ -1089,9 +1308,10 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
                         _generate_openai_image(
                             client,
                             final_prompt,
-                            aspect_ratio,
+                            engine_aspect_ratio,
                             openai_quality,
                             openai_key,
+                            openai_size,
                         )
                     ),
                     asyncio.create_task(
@@ -1099,7 +1319,7 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
                             client,
                             final_prompt,
                             improved["negative_prompt"],
-                            aspect_ratio,
+                            engine_aspect_ratio,
                             fal_key,
                         )
                     ),
@@ -1107,7 +1327,7 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
                         _generate_google_best_available(
                             client,
                             final_prompt,
-                            aspect_ratio,
+                            engine_aspect_ratio,
                             gemini_key,
                         )
                     ),
@@ -1121,6 +1341,7 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
                 for coro in asyncio.as_completed(tasks):
                     try:
                         result = await coro
+                        result = await _apply_postprocess_if_needed(client, result, requested_dimensions)
                         completed_results.append(result)
                         done_count += 1
 
@@ -1193,6 +1414,8 @@ async def image_engine_edit_stream(
     formato: str = Form(...),
     qualidade: str = Form(...),
     instrucoes_edicao: str = Form(...),
+    width: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
     current_user: User = Depends(get_current_user),
 ):
     del current_user
@@ -1207,6 +1430,8 @@ async def image_engine_edit_stream(
         formato=formato,
         qualidade=qualidade,
         instrucoes_edicao=instrucoes_edicao,
+        width=width,
+        height=height,
     )
 
     async def event_generator():
@@ -1220,35 +1445,46 @@ async def image_engine_edit_stream(
             if not body.instrucoes_edicao.strip():
                 raise ValueError("As instruções de edição são obrigatórias.")
 
+            requested_dimensions = _resolve_target_dimensions(body.width, body.height)
             aspect_ratio = _normalize_aspect_ratio(body.formato)
             openai_quality = _normalize_quality(body.qualidade)
+
+            if requested_dimensions:
+                base_width, base_height = _choose_best_supported_base_size(*requested_dimensions)
+                engine_aspect_ratio = _base_size_to_aspect_ratio(base_width, base_height)
+                openai_size = f"{base_width}x{base_height}"
+            else:
+                engine_aspect_ratio = aspect_ratio
+                openai_size = _openai_size_from_aspect_ratio(engine_aspect_ratio)
 
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
                 yield _sse({
                     "status": "Analisando a imagem de referência e refinando o prompt de edição...",
                     "progress": 14,
                     "meta": {
-                        "aspect_ratio": aspect_ratio,
+                        "aspect_ratio": engine_aspect_ratio,
                         "quality": openai_quality,
                         "reference_filename": image_filename,
+                        "openai_size": openai_size,
+                        "target_dimensions": {"width": requested_dimensions[0], "height": requested_dimensions[1]} if requested_dimensions else None,
                     },
                 })
 
                 improved = await _improve_edit_prompt_with_openai(
                     client=client,
                     payload=body,
-                    aspect_ratio=aspect_ratio,
+                    aspect_ratio=engine_aspect_ratio,
                     openai_key=openai_key,
                 )
 
                 final_prompt = _build_final_edit_prompt(
                     payload=body,
-                    aspect_ratio=aspect_ratio,
+                    aspect_ratio=engine_aspect_ratio,
                     improved=improved,
                 )
 
                 yield _sse({
-                    "status": "Prompt refinado. Enviando a imagem de referência para edição final.",
+                    "status": "Prompt refinado. Tentando localizar a área exata da edição antes de enviar para a engine final.",
                     "progress": 46,
                     "improved_prompt": improved["prompt_final"],
                     "negative_prompt": improved["negative_prompt"],
@@ -1259,20 +1495,79 @@ async def image_engine_edit_stream(
                     "micro_detail_rules": improved["micro_detail_rules"],
                     "consistency_rules": improved["consistency_rules"],
                     "final_prompt": final_prompt,
-                    "aspect_ratio": aspect_ratio,
+                    "aspect_ratio": engine_aspect_ratio,
                     "quality": openai_quality,
+                    "openai_size": openai_size,
+                    "target_dimensions": {"width": requested_dimensions[0], "height": requested_dimensions[1]} if requested_dimensions else None,
                 })
 
-                result = await _edit_openai_image(
-                    client=client,
-                    image_bytes=image_bytes,
-                    filename=image_filename,
-                    content_type=image_content_type,
-                    final_prompt=final_prompt,
-                    aspect_ratio=aspect_ratio,
-                    quality=openai_quality,
-                    openai_key=openai_key,
-                )
+                localized_analysis = None
+                localized_mask = None
+                localized_mode = False
+                localized_warning = None
+
+                try:
+                    localized_analysis = await analyze_region_with_openai(
+                        client=client,
+                        image_bytes=image_bytes,
+                        content_type=image_content_type,
+                        instruction=body.instrucoes_edicao,
+                        model=OPENAI_CHAT_MODEL,
+                        api_key=openai_key,
+                    )
+                    if should_use_localized_edit(localized_analysis):
+                        localized_mask = build_mask_from_analysis(image_bytes, localized_analysis)
+                        localized_mode = localized_mask is not None
+                except Exception as region_exc:
+                    localized_warning = f"Falha na detecção localizada. Seguindo com fallback seguro. Detalhe: {str(region_exc)}"
+
+                if localized_mode:
+                    yield _sse({
+                        "status": "Área localizada com sucesso. Aplicando edição mascarada para preservar o restante da imagem.",
+                        "progress": 62,
+                        "localized_analysis": localized_analysis,
+                        "localized_mode": True,
+                        "warning": localized_warning,
+                    })
+                else:
+                    yield _sse({
+                        "status": "Não foi possível garantir uma área segura. Aplicando o fallback de edição padrão com preservação reforçada.",
+                        "progress": 62,
+                        "localized_analysis": localized_analysis,
+                        "localized_mode": False,
+                        "warning": localized_warning,
+                    })
+
+                try:
+                    result = await _edit_openai_image(
+                        client=client,
+                        image_bytes=image_bytes,
+                        filename=image_filename,
+                        content_type=image_content_type,
+                        final_prompt=final_prompt,
+                        aspect_ratio=engine_aspect_ratio,
+                        quality=openai_quality,
+                        openai_key=openai_key,
+                        openai_size=openai_size,
+                        mask_bytes=localized_mask,
+                        input_fidelity="high",
+                    )
+                except Exception as edit_exc:
+                    if localized_mode:
+                        fallback_bytes = render_local_text_fallback(image_bytes=image_bytes, analysis=localized_analysis or {})
+                        if fallback_bytes:
+                            result = {
+                                "engine_id": "local_structured_edit",
+                                "motor": "Edição Local Estruturada",
+                                "url": _data_uri_from_b64(base64.b64encode(fallback_bytes).decode("utf-8"), "image/png"),
+                                "raw": {"fallback_reason": str(edit_exc)},
+                            }
+                        else:
+                            raise
+                    else:
+                        raise
+
+                result = await _apply_postprocess_if_needed(client, result, requested_dimensions)
 
                 yield _sse({
                     "status": f"Edição concluída com sucesso em {result['motor']}.",
@@ -1282,6 +1577,8 @@ async def image_engine_edit_stream(
                         "motor": result["motor"],
                         "url": result["url"],
                     },
+                    "localized_mode": localized_mode,
+                    "localized_analysis": localized_analysis,
                 })
 
                 yield _sse({
@@ -1296,6 +1593,8 @@ async def image_engine_edit_stream(
                     "micro_detail_rules": improved["micro_detail_rules"],
                     "consistency_rules": improved["consistency_rules"],
                     "final_prompt": final_prompt,
+                    "localized_mode": localized_mode,
+                    "localized_analysis": localized_analysis,
                     "final_results": [
                         {
                             "engine_id": result["engine_id"],

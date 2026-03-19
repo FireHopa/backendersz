@@ -5,8 +5,10 @@ from typing import Optional
 
 from sqlmodel import SQLModel, Field
 
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
 
 class User(SQLModel, table=True):
     __tablename__ = "user"
@@ -14,20 +16,65 @@ class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str = Field(unique=True, index=True)
     full_name: Optional[str] = Field(default=None)
-    
+
     hashed_password: Optional[str] = Field(default=None)
     google_id: Optional[str] = Field(default=None, index=True)
-    
-    # Controle de créditos diários
+
     credits: int = Field(default=100)
     last_credit_reset: datetime = Field(default_factory=utcnow)
-    
-    # NOVOS CAMPOS: Autenticação LinkedIn
+
     linkedin_access_token: Optional[str] = Field(default=None)
     linkedin_token_expires_at: Optional[datetime] = Field(default=None)
-    linkedin_urn: Optional[str] = Field(default=None) # Necessário para postar (ex: urn:li:person:12345)
-    
+    linkedin_urn: Optional[str] = Field(default=None)
+
+    instagram_meta_access_token: Optional[str] = Field(default=None)
+    instagram_meta_token_expires_at: Optional[datetime] = Field(default=None)
+    instagram_account_id: Optional[str] = Field(default=None)
+    instagram_page_id: Optional[str] = Field(default=None)
+    instagram_username: Optional[str] = Field(default=None)
+
+    facebook_user_access_token: Optional[str] = Field(default=None)
+    facebook_user_token_expires_at: Optional[datetime] = Field(default=None)
+    facebook_page_id: Optional[str] = Field(default=None)
+    facebook_page_name: Optional[str] = Field(default=None)
+    facebook_page_username: Optional[str] = Field(default=None)
+    facebook_page_access_token: Optional[str] = Field(default=None)
+    facebook_pages_json: Optional[str] = Field(default="[]")
+
+    youtube_access_token: Optional[str] = Field(default=None)
+    youtube_refresh_token: Optional[str] = Field(default=None)
+    youtube_token_expires_at: Optional[datetime] = Field(default=None)
+    youtube_channel_id: Optional[str] = Field(default=None)
+    youtube_channel_title: Optional[str] = Field(default=None)
+    youtube_channel_handle: Optional[str] = Field(default=None)
+    youtube_channel_thumbnail: Optional[str] = Field(default=None)
+
+    tiktok_access_token: Optional[str] = Field(default=None)
+    tiktok_refresh_token: Optional[str] = Field(default=None)
+    tiktok_token_expires_at: Optional[datetime] = Field(default=None)
+    tiktok_refresh_token_expires_at: Optional[datetime] = Field(default=None)
+    tiktok_open_id: Optional[str] = Field(default=None)
+    tiktok_scope: Optional[str] = Field(default=None)
+    tiktok_display_name: Optional[str] = Field(default=None)
+    tiktok_username: Optional[str] = Field(default=None)
+    tiktok_avatar_url: Optional[str] = Field(default=None)
+    tiktok_profile_url: Optional[str] = Field(default=None)
+    tiktok_is_verified: bool = Field(default=False)
+    tiktok_privacy_options_json: Optional[str] = Field(default=None)
+
+    google_business_access_token: Optional[str] = Field(default=None)
+    google_business_refresh_token: Optional[str] = Field(default=None)
+    google_business_token_expires_at: Optional[datetime] = Field(default=None)
+    google_business_account_name: Optional[str] = Field(default=None)
+    google_business_account_display_name: Optional[str] = Field(default=None)
+    google_business_location_name: Optional[str] = Field(default=None)
+    google_business_location_title: Optional[str] = Field(default=None)
+    google_business_location_store_code: Optional[str] = Field(default=None)
+    google_business_location_category: Optional[str] = Field(default=None)
+    google_business_locations_json: Optional[str] = Field(default="[]")
+
     created_at: datetime = Field(default_factory=utcnow)
+
 
 class Robot(SQLModel, table=True):
     __tablename__ = "robot"
@@ -42,17 +89,18 @@ class Robot(SQLModel, table=True):
 
     system_instructions: str
     model: str = Field(default="gpt-4o-mini")
-    
+
     knowledge_files_json: str = Field(default="[]")
 
     created_at: datetime = Field(default_factory=utcnow)
 
+
 class BusinessCore(SQLModel, table=True):
     __tablename__ = "business_core"
-    
+
     id: Optional[int] = Field(default=None, primary_key=True)
     robot_id: int = Field(foreign_key="robot.id", index=True, unique=True)
-    
+
     company_name: str = Field(default="")
     city_state: str = Field(default="")
     service_area: str = Field(default="")
@@ -60,12 +108,12 @@ class BusinessCore(SQLModel, table=True):
     services_products: str = Field(default="")
     real_differentials: str = Field(default="")
     restrictions: str = Field(default="")
-    
+
     reviews: str = Field(default="")
     testimonials: str = Field(default="")
     usable_links_texts: str = Field(default="")
     forbidden_content: str = Field(default="")
-    
+
     site: str = Field(default="")
     google_business_profile: str = Field(default="")
     instagram: str = Field(default="")
@@ -73,10 +121,11 @@ class BusinessCore(SQLModel, table=True):
     youtube: str = Field(default="")
     tiktok: str = Field(default="")
 
-    knowledge_text: str = Field(default="") 
-    knowledge_files_json: str = Field(default="[]") 
-    
+    knowledge_text: str = Field(default="")
+    knowledge_files_json: str = Field(default="[]")
+
     updated_at: datetime = Field(default_factory=utcnow)
+
 
 class ChatMessage(SQLModel, table=True):
     __tablename__ = "chat_message"
@@ -87,6 +136,7 @@ class ChatMessage(SQLModel, table=True):
     role: str
     content: str
     created_at: datetime = Field(default_factory=utcnow)
+
 
 class CompetitionAnalysis(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
@@ -105,6 +155,7 @@ class CompetitionAnalysis(SQLModel, table=True):
 
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+
 
 class AuthorityEdit(SQLModel, table=True):
     __tablename__ = "authority_edit"
@@ -125,12 +176,13 @@ class AuthorityEdit(SQLModel, table=True):
 
     created_at: datetime = Field(default_factory=utcnow)
 
+
 class AuthorityAgentRun(SQLModel, table=True):
     __tablename__ = "authority_agent_run"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
-    client_id: str = Field(index=True) 
+    client_id: str = Field(index=True)
     agent_key: str = Field(index=True)
     nucleus_json: str
     output_text: str

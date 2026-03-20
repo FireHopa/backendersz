@@ -149,7 +149,7 @@ def _call_chat_json(
     messages.append({"role": "user", "content": user_content})
 
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=gpt-5.4,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
@@ -2182,6 +2182,14 @@ def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
     selected_theme = _trim_text(nucleus.get("selected_theme"))
 
     requested_task_lower = requested_task.lower() if requested_task else ""
+
+    if agent_key == "instagram" and requested_task_lower == "roteiros":
+        return _json_dumps(_run_instagram_script_task(agent_key, nucleus, requested_task, selected_theme))
+    if agent_key == "instagram" and "destaques estratégicos" in requested_task_lower:
+        return _json_dumps(_run_instagram_highlights_task(nucleus))
+    if agent_key == "instagram" and "legendas estratégicas" in requested_task_lower:
+        return _json_dumps(_run_instagram_captions_task(nucleus, selected_theme))
+
     is_script_task = any(term in requested_task_lower for term in [
         "roteiro",
         "reels",
@@ -2251,61 +2259,224 @@ PRIORIDADES DE EXECUÇÃO:
     return _json_dumps(normalized)
 
 
+VIDEO_FORMAT_LABELS = {
+    "direct_camera": "Você falando direto para a câmera",
+    "screen_plus_commentary": "Tela + você comentando",
+    "front_of_content": "Você na frente do conteúdo",
+    "reaction_commentary": "Reação ou comentário",
+    "video_checklist": "Checklist em vídeo",
+    "before_after": "Antes e depois",
+    "common_error_fix": "Erro comum + correção",
+    "social_proof": "Prova social",
+    "behind_the_scenes": "Bastidores com narração",
+    "myth_vs_reality": "Mito vs realidade",
+    "comparison_a_vs_b": "Comparativo A vs B",
+    "quick_diagnosis": "Diagnóstico ou opinião rápida",
+}
+
+
+def _video_format_label(value: str) -> str:
+    return VIDEO_FORMAT_LABELS.get(_trim_text(value), _trim_text(value) or "não informado")
+
+
+def suggest_video_format_for_theme(agent_key: str, nucleus: Dict[str, Any], theme: str) -> Dict[str, str]:
+    _require_key()
+    clean_theme = _trim_text(theme)
+    if not clean_theme:
+        raise ValueError("Tema não informado para sugerir formato de vídeo.")
+
+    system = """
+Você recomenda o melhor formato de vídeo para Instagram com base no tema, no objetivo do conteúdo e no contexto do negócio.
+Responda SOMENTE em JSON com as chaves: recommended_format_id, rationale.
+Escolha obrigatoriamente um dos formatos válidos abaixo:
+- direct_camera
+- screen_plus_commentary
+- front_of_content
+- reaction_commentary
+- video_checklist
+- before_after
+- common_error_fix
+- social_proof
+- behind_the_scenes
+- myth_vs_reality
+- comparison_a_vs_b
+- quick_diagnosis
+
+Critérios:
+- escolha o formato mais claro e mais forte para explicar o tema
+- priorize retenção, clareza e naturalidade
+- não invente fatos
+- rationale curta, objetiva e prática
+""".strip()
+
+    user = {
+        "agent_key": agent_key,
+        "theme": clean_theme,
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "nucleus": nucleus or {},
+    }
+    data = _call_chat_json(system=system, user=user, temperature=0.3, max_tokens=600)
+    fmt = _trim_text(data.get("recommended_format_id"))
+    if fmt not in VIDEO_FORMAT_LABELS:
+        fmt = "direct_camera"
+    rationale = _trim_text(data.get("rationale"), max_chars=240) or "Formato escolhido por ser o mais claro e natural para explicar esse tema com retenção."
+    return {
+        "recommended_format_id": fmt,
+        "recommended_format_label": _video_format_label(fmt),
+        "rationale": rationale,
+    }
+
+
+def _run_instagram_script_task(agent_key: str, nucleus: Dict[str, Any], requested_task: str, selected_theme: str) -> Dict[str, Any]:
+    selected_format_id = _trim_text(nucleus.get("video_format")) or _trim_text(nucleus.get("selected_video_format"))
+    recommended_format_label = _trim_text(nucleus.get("recommended_video_format"))
+    if not recommended_format_label and _trim_text(nucleus.get("recommended_video_format_id")):
+        recommended_format_label = _video_format_label(_trim_text(nucleus.get("recommended_video_format_id")))
+    selected_format_label = _video_format_label(selected_format_id)
+
+    system = """
+Você cria roteiros de Instagram graváveis, claros e estratégicos.
+Responda SOMENTE em JSON com as chaves:
+- titulo_da_tela
+- analise_do_tema
+- estrategia_do_video
+- hooks (array com 4 itens)
+- roteiro_segundo_a_segundo (array de objetos com tempo, acao, fala)
+- texto_na_tela (array)
+- variacoes (array com 3 itens)
+- legenda
+
+Regras:
+- pt-BR
+- fala natural, humana e gravável
+- sem frases genéricas de guru
+- o formato do vídeo precisa influenciar a construção do roteiro
+- analise_do_tema e estrategia_do_video devem ser objetivas
+- legenda curta, útil e coerente com o tema
+""".strip()
+    user = {
+        "task": requested_task,
+        "theme": selected_theme,
+        "selected_video_format": selected_format_label,
+        "recommended_video_format": recommended_format_label or selected_format_label,
+        "recommended_video_format_reason": _trim_text(nucleus.get("recommended_video_format_reason")),
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "nucleus": nucleus or {},
+    }
+    data = _call_chat_json(system=system, user=user, temperature=0.45, max_tokens=2600)
+    normalized = _normalize_authority_output(data)
+    if isinstance(normalized, dict):
+        normalized["video_format_selected"] = selected_format_label
+        normalized["video_format_recommended"] = recommended_format_label or selected_format_label
+        normalized["video_format_rationale"] = _trim_text(nucleus.get("recommended_video_format_reason")) or "Formato sugerido pela IA para melhorar clareza, retenção e naturalidade desse tema."
+    return normalized
+
+
+def _run_instagram_highlights_task(nucleus: Dict[str, Any]) -> Dict[str, Any]:
+    system = """
+Sua missão é criar uma estrutura estratégica de Destaques para Instagram.
+Responda SOMENTE em JSON com:
+- titulo_da_tela
+- blocos (array)
+
+Use somente tipos de bloco: markdown, highlight, service_cards.
+
+Estruture em:
+1. análise estratégica
+2. estrutura ideal dos Destaques
+3. ordem recomendada
+4. direção visual das capas
+5. recomendação final
+
+Para a estrutura ideal dos Destaques, use service_cards, com 4 a 7 itens e campos:
+- nome
+- descricao
+- palavras_chave
+
+Na descrição de cada item, deixe claro função estratégica, o que deve conter e como ajuda em SEO, AEO ou GEO.
+Evite nomes genéricos.
+""".strip()
+    user = {"nucleus_digest": _build_nucleus_digest(nucleus or {}), "nucleus": nucleus or {}}
+    return _normalize_authority_output(_call_chat_json(system=system, user=user, temperature=0.35, max_tokens=2200))
+
+
+def _run_instagram_captions_task(nucleus: Dict[str, Any], selected_theme: str) -> Dict[str, Any]:
+    system = """
+Sua missão é criar legendas estratégicas para Instagram.
+Responda SOMENTE em JSON com:
+- titulo_da_tela
+- blocos (array)
+
+Use somente tipos de bloco: markdown, highlight, response_variations, keyword_list.
+
+Estruture em:
+1. análise estratégica
+2. estrutura ideal da legenda
+3. 5 legendas prontas
+4. frases finais de engajamento
+5. palavras-chave estratégicas
+6. recomendação final
+
+Regras:
+- as 5 legendas prontas devem vir em um bloco response_variations
+- as 10 frases finais também devem vir em um bloco response_variations separado
+- palavras-chave estratégicas em um bloco keyword_list
+- linguagem humana, natural e sem cara de texto de IA
+- sem frases motivacionais genéricas
+""".strip()
+    user = {
+        "theme": selected_theme,
+        "content_type": _trim_text(nucleus.get("content_type")) or "não informado",
+        "content_goal": _trim_text(nucleus.get("content_goal")) or "não informado",
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "nucleus": nucleus or {},
+    }
+    return _normalize_authority_output(_call_chat_json(system=system, user=user, temperature=0.4, max_tokens=2600))
+
+
 def suggest_themes_for_task(agent_key: str, nucleus: Dict[str, Any], task: str) -> List[str]:
     _require_key()
 
     agent = AUTHORITY_AGENTS.get(agent_key)
-    agent_context = {
-        "agent_key": agent_key,
-        "agent_name": agent["name"] if agent else "não informado",
-        "agent_type": agent["type"] if agent else "não informado",
-    }
-    task_profile = _infer_task_profile(agent_key, _trim_text(task), False)
-    nucleus_digest = _build_nucleus_digest(nucleus or {})
-
     user_prompt = {
         "task": _trim_text(task),
-        "agent_context": agent_context,
-        "task_profile": task_profile,
-        "nucleus_digest": nucleus_digest,
-        "nucleus": nucleus or {},
-        "framework_steps": [
-            "Classificar a tarefa pelo estágio estratégico e pela intenção principal.",
-            "Ler o núcleo da empresa e identificar ofertas, público, dores, provas e diferenciais reais.",
-            "Gerar ângulos específicos que fariam sentido para esse agente e para esse negócio.",
-            "Eliminar temas genéricos, amplos ou clichês demais.",
-            "Condensar em 5 temas curtos, fortes e claros.",
-        ],
-        "required_output_shape": {
-            "passo_1_classificacao": "string",
-            "passo_2_leitura_estrategica_nucleo": "string",
-            "passo_3_aplicacao_framework": "string",
-            "passo_4_filtro_qualidade": "string",
-            "passo_5_detalhamento_interno": "string",
-            "themes": [
-                "[Título Ultra Curto] | Foco: [1 palavra]",
-                "[Título Ultra Curto] | Foco: [1 palavra]",
-                "[Título Ultra Curto] | Foco: [1 palavra]",
-                "[Título Ultra Curto] | Foco: [1 palavra]",
-                "[Título Ultra Curto] | Foco: [1 palavra]",
-            ],
+        "agent_context": {
+            "agent_key": agent_key,
+            "agent_name": agent["name"] if agent else "não informado",
+            "agent_type": agent["type"] if agent else "não informado",
         },
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "nucleus": nucleus or {},
+        "mission": "Gerar 5 sugestões estratégicas de tema com ângulo forte, específico e útil para esse negócio.",
+        "rules": [
+            "Evitar clichês, placeholders e títulos vazios.",
+            "Não usar fórmulas genéricas como erro fatal, segredo, decisão que vende ou prova que convence sem contexto forte.",
+            "Priorizar ângulos de conteúdo e utilidade prática.",
+            "As 5 sugestões devem ser diferentes entre si.",
+            "Responder somente em JSON com a chave themes.",
+        ],
+        "output": {"themes": ["string", "string", "string", "string", "string"]},
     }
 
     try:
         data = _call_chat_json(
             system=AUTHORITY_THEME_SUGGESTION_SYSTEM,
             user=user_prompt,
-            temperature=0.45,
-            max_tokens=DEFAULT_THEME_SUGGESTION_MAX_TOKENS,
+            temperature=0.5,
+            max_tokens=1400,
         )
         themes = data.get("themes")
         if isinstance(themes, list):
-            normalized = []
+            normalized: List[str] = []
+            seen = set()
             for item in themes:
-                clean = _trim_text(item, max_chars=90)
+                clean = _trim_text(item, max_chars=120)
                 if not clean:
                     continue
+                key = clean.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
                 normalized.append(clean)
             if len(normalized) >= 5:
                 return normalized[:5]
@@ -2313,9 +2484,219 @@ def suggest_themes_for_task(agent_key: str, nucleus: Dict[str, Any], task: str) 
         pass
 
     return [
-        "Por que isso importa? | Foco: Contexto",
-        "Erro que trava resultado | Foco: Alerta",
-        "Como funciona na prática | Foco: Processo",
-        "O que muda na decisão | Foco: Clareza",
-        "O diferencial real aqui | Foco: Valor",
+        "Por que seu conteúdo informa, mas não posiciona",
+        "O erro que deixa seu perfil claro para você e confuso para o público",
+        "Como transformar um tema técnico em conteúdo simples e forte",
+        "O tipo de conteúdo que aumenta autoridade antes da venda",
+        "3 sinais de que seu conteúdo está bonito, mas não estratégico",
     ]
+
+
+
+def _skybob_prompt_payload(nucleus: Dict[str, Any], preferences: Optional[Dict[str, Any]] = None, previous_study: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "framework": "SkyBob",
+        "model": "gpt-5.4",
+        "objective": "Construir um estudo estratégico de calendário editorial a partir do núcleo da empresa, identificando padrões de conteúdo que já viralizam no nicho e oportunidades reais para fazer melhor.",
+        "original_instructions_preserved": {
+            "mapeamento": [
+                "Os principais tipos de vídeos que já performam bem nesse nicho.",
+                "Quais temas aparecem com mais frequência no que viraliza.",
+                "Quais formatos se repetem.",
+            ],
+            "formatos_base": [
+                "Você falando direto para a câmera",
+                "Tela + você comentando",
+                "Você na frente do conteúdo",
+                "Reação ou comentário",
+                "Checklist em vídeo",
+                "Antes e depois",
+                "Erro comum + correção",
+                "Prova social",
+                "Bastidores com narração",
+                "Mito vs realidade",
+                "Comparativo A vs B",
+                "Diagnóstico ou opinião rápida",
+            ],
+            "hooks": [
+                "Quais tipos de frases de abertura mais se repetem nos vídeos virais.",
+                "Quais tipos de gancho visual aparecem.",
+                "Quais emoções dominantes esses vídeos ativam.",
+            ],
+            "ganchos_visuais": ["Print", "Mapa", "Texto grande", "Antes/depois", "Close no rosto", "Tela gravada"],
+            "emocoes": ["Medo de perder dinheiro", "Curiosidade", "Indignação", "Alívio", "Sensação de descoberta"],
+            "sintese": [
+                "Resumir os 5 maiores padrões de sucesso do nicho.",
+                "Listar os erros mais comuns que fazem conteúdos não performarem.",
+                "Apontar oportunidades de diferenciação para criar conteúdos melhores, mais claros e mais úteis do que a média do nicho.",
+            ],
+            "entrega": [
+                "Visão geral do nicho",
+                "O que já viraliza hoje",
+                "Padrões de hooks e formatos",
+                "Oportunidades para se destacar",
+            ],
+            "rules": [
+                "Não copiar criadores específicos.",
+                "Não citar nomes de perfis.",
+                "Trabalhar com padrões de mercado e formatos.",
+                "Linguagem clara, prática e aplicável.",
+                "Foco em estratégia, não em moda passageira.",
+            ],
+        },
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "nucleus": nucleus or {},
+        "feedback_preferences": preferences or {},
+        "previous_study": previous_study or {},
+        "output_contract": {
+            "overview": "string",
+            "success_patterns": ["string", "string", "string", "string", "string"],
+            "mistakes": ["string"],
+            "opportunities": ["string"],
+            "cards": [
+                {
+                    "id": "string",
+                    "section": "overview|viral|hooks|formats|patterns|mistakes|opportunities|calendar",
+                    "title": "string",
+                    "body": "string",
+                    "bullets": ["string"],
+                    "badges": ["string"]
+                }
+            ],
+            "calendar_recommendations": ["string"],
+        },
+    }
+
+
+def _skybob_study_to_text(study: Dict[str, Any]) -> str:
+    lines: List[str] = ["SkyBob", "", "Visão geral do nicho", str(study.get("overview") or "").strip(), ""]
+
+    mapping = [
+        ("Padrões de sucesso", study.get("success_patterns") or []),
+        ("Erros mais comuns", study.get("mistakes") or []),
+        ("Oportunidades para se destacar", study.get("opportunities") or []),
+        ("Recomendações de calendário editorial", study.get("calendar_recommendations") or []),
+    ]
+    for title, items in mapping:
+        if not items:
+            continue
+        lines.append(title)
+        for item in items:
+            clean = _trim_text(item)
+            if clean:
+                lines.append(f"- {clean}")
+        lines.append("")
+
+    cards = study.get("cards") or []
+    if isinstance(cards, list) and cards:
+        lines.append("Blocos estratégicos")
+        for card in cards:
+            title = _trim_text((card or {}).get("title"))
+            body = _trim_text((card or {}).get("body"))
+            if title:
+                lines.append(f"- {title}: {body}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def generate_skybob_study(nucleus: Dict[str, Any], preferences: Optional[Dict[str, Any]] = None, previous_study: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    _require_key()
+
+    system = """
+Você é o SkyBob, um estrategista editorial sênior focado em padrões de mercado, estrutura de conteúdo e clareza prática.
+
+Sua missão é analisar o nicho com base no núcleo da empresa e produzir um estudo estratégico útil para calendário editorial.
+
+Regras obrigatórias:
+1. Preserve a essência exata do método SkyBob recebido.
+2. Não cite nomes de perfis, influenciadores ou criadores específicos.
+3. Trabalhe com padrões de mercado, estruturas, hooks, formatos e repetições observáveis.
+4. Seja específico, aplicável e prático.
+5. Não entregue modinhas passageiras como se fossem estratégia.
+6. Gere saída somente em JSON válido.
+7. Cada card precisa ser independente, útil e movível na interface.
+8. Quando houver feedback do usuário sobre o que gostou e não gostou, refine a próxima resposta para se aproximar do que foi bem avaliado e reduzir o que foi mal avaliado.
+9. Não invente métricas ou números exatos sem base. Use linguagem como tende a, costuma, aparece com frequência, normalmente.
+10. A resposta precisa ser escrita em português do Brasil.
+11. Não resuma demais. A profundidade é desejável quando ela aumentar clareza, aplicabilidade e valor estratégico.
+""".strip()
+
+    payload = _skybob_prompt_payload(nucleus, preferences=preferences, previous_study=previous_study)
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": _json_dumps(payload)},
+    ]
+
+    preferred_model = (OPENAI_MODEL or "gpt-5.4").strip()
+    fallback_models = [preferred_model]
+    for candidate in ["gpt-5.4", "gpt-4.1"]:
+        if candidate and candidate not in fallback_models:
+            fallback_models.append(candidate)
+
+    last_error: Exception | None = None
+    raw = ""
+    for model_name in fallback_models:
+        try:
+            client = OpenAI(
+                api_key=OPENAI_API_KEY,
+                timeout=180.0,
+                max_retries=1,
+            )
+            try:
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=0.55,
+                    response_format={"type": "json_object"},
+                )
+            except Exception:
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=0.55,
+                )
+            raw = (resp.choices[0].message.content or "").strip()
+            data = _loads_json_object(raw)
+            if isinstance(data, dict):
+                break
+        except Exception as e:
+            last_error = e
+            data = None
+            continue
+    else:
+        raise RuntimeError(f"Falha ao executar o SkyBob no provedor de IA: {last_error}")
+
+    cards = data.get("cards")
+    normalized_cards: List[Dict[str, Any]] = []
+    if isinstance(cards, list):
+        for index, item in enumerate(cards):
+            if not isinstance(item, dict):
+                continue
+            normalized_cards.append({
+                "id": _trim_text(item.get("id") or f"card-{index+1}", max_chars=120) or f"card-{index+1}",
+                "section": _trim_text(item.get("section") or "patterns", max_chars=80) or "patterns",
+                "title": _trim_text(item.get("title") or f"Bloco {index+1}", max_chars=240) or f"Bloco {index+1}",
+                "body": _trim_text(item.get("body") or "", max_chars=4000),
+                "bullets": [
+                    _trim_text(b, max_chars=500)
+                    for b in (item.get("bullets") or [])
+                    if _trim_text(b, max_chars=500)
+                ],
+                "badges": [
+                    _trim_text(b, max_chars=80)
+                    for b in (item.get("badges") or [])
+                    if _trim_text(b, max_chars=80)
+                ],
+            })
+
+    result = {
+        "overview": _trim_text(data.get("overview"), max_chars=12000),
+        "success_patterns": [_trim_text(x, max_chars=1000) for x in (data.get("success_patterns") or []) if _trim_text(x, max_chars=1000)],
+        "mistakes": [_trim_text(x, max_chars=1000) for x in (data.get("mistakes") or []) if _trim_text(x, max_chars=1000)],
+        "opportunities": [_trim_text(x, max_chars=1000) for x in (data.get("opportunities") or []) if _trim_text(x, max_chars=1000)],
+        "calendar_recommendations": [_trim_text(x, max_chars=1000) for x in (data.get("calendar_recommendations") or []) if _trim_text(x, max_chars=1000)],
+        "cards": normalized_cards,
+    }
+    result["serialized_text"] = _skybob_study_to_text(result)
+    return result

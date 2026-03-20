@@ -156,14 +156,14 @@ def _extract_text_replacement(instruction: str) -> Optional[Dict[str, str]]:
         return None
 
     patterns = [
-        r'troqu[eia]?\s+["“”\'](?P<old>.+?)["“”\']\s+por\s+["“”\'](?P<new>.+?)["“”\']',
-        r'substitu[a-z]*\s+["“”\'](?P<old>.+?)["“”\']\s+por\s+["“”\'](?P<new>.+?)["“”\']',
-        r'alter[eia]?\s+["“”\'](?P<old>.+?)["“”\']\s+para\s+["“”\'](?P<new>.+?)["“”\']',
-        r'mud[eia]?\s+["“”\'](?P<old>.+?)["“”\']\s+para\s+["“”\'](?P<new>.+?)["“”\']',
-        r'troqu[eia]?\s+(?P<old>[^\n]+?)\s+por\s+(?P<new>[^\n]+)',
-        r'substitu[a-z]*\s+(?P<old>[^\n]+?)\s+por\s+(?P<new>[^\n]+)',
-        r'alter[eia]?\s+(?P<old>[^\n]+?)\s+para\s+(?P<new>[^\n]+)',
-        r'mud[eia]?\s+(?P<old>[^\n]+?)\s+para\s+(?P<new>[^\n]+)',
+        r"troqu[eia]?\s+[\"“”'](?P<old>.+?)[\"“”']\s+por\s+[\"“”'](?P<new>.+?)[\"“”']",
+        r"substitu[a-z]*\s+[\"“”'](?P<old>.+?)[\"“”']\s+por\s+[\"“”'](?P<new>.+?)[\"“”']",
+        r"alter[eia]?\s+[\"“”'](?P<old>.+?)[\"“”']\s+para\s+[\"“”'](?P<new>.+?)[\"“”']",
+        r"mud[eia]?\s+[\"“”'](?P<old>.+?)[\"“”']\s+para\s+[\"“”'](?P<new>.+?)[\"“”']",
+        r"troqu[eia]?\s+(?P<old>[^\n]+?)\s+por\s+(?P<new>[^\n]+)",
+        r"substitu[a-z]*\s+(?P<old>[^\n]+?)\s+por\s+(?P<new>[^\n]+)",
+        r"alter[eia]?\s+(?P<old>[^\n]+?)\s+para\s+(?P<new>[^\n]+)",
+        r"mud[eia]?\s+(?P<old>[^\n]+?)\s+para\s+(?P<new>[^\n]+)",
     ]
 
     for pattern in patterns:
@@ -174,6 +174,46 @@ def _extract_text_replacement(instruction: str) -> Optional[Dict[str, str]]:
             if old and new and old.lower() != new.lower():
                 return {"old_text": old, "new_text": new}
     return None
+
+
+def extract_edit_instruction_info(text: str) -> Dict[str, Any]:
+    raw = (text or "").strip()
+    lowered = raw.lower()
+    replacement = _extract_text_replacement(raw)
+
+    pure_text_positive_patterns = [
+        r"\b(troque|substitua|mude|altere|corrija|edite|atualize)\b.*\b(texto|frase|headline|subheadline|bot[aã]o|cta|data|cidade|local)\b",
+        r"\b(troque|substitua|mude|altere|corrija|atualize)\b.+\bpara\b.+",
+    ]
+    broad_visual_markers = [
+        "fundo", "background", "cenário", "cenario", "produto", "pessoa", "rosto", "objeto", "logo", "logotipo",
+        "marca", "remove", "remova", "adicione", "adicionar", "insira", "troque a cor", "mudar cor", "cor do",
+        "iluminação", "iluminacao", "sombra", "perspectiva", "composição", "composicao", "estilo", "realista",
+        "fotorrealista", "avatar", "personagem", "roupa", "embalagem", "cenografia"
+    ]
+    mentions_broad_visual = any(token in lowered for token in broad_visual_markers)
+    positive_match = any(re.search(pattern, raw, flags=re.IGNORECASE) for pattern in pure_text_positive_patterns)
+
+    edit_type = "generic_edit"
+    if replacement and (positive_match or not mentions_broad_visual):
+        edit_type = "text_replace"
+
+    target_hint = None
+    if replacement:
+        target_hint = replacement["old_text"]
+    else:
+        hint_match = re.search(r"\b(bot[aã]o|cta|headline|subheadline|data|cidade|local)\b", raw, flags=re.IGNORECASE)
+        if hint_match:
+            target_hint = hint_match.group(1)
+
+    return {
+        "raw_instruction": raw,
+        "edit_type": edit_type,
+        "replacement": replacement,
+        "target_hint": target_hint,
+        "is_pure_text_edit": bool(edit_type == "text_replace" and replacement),
+        "mentions_broad_visual_changes": mentions_broad_visual,
+    }
 
 
 def _encode_png(image: Image.Image) -> bytes:
@@ -548,6 +588,9 @@ Regras:
 4. Se o texto estiver dentro de botão, badge ou chip, preencha container_bbox com a área completa do elemento e use operation=button_text_replace.
 5. Priorize precisão e preservação do restante da imagem.
 6. Se houver candidatos locais fornecidos, use-os como reforço de precisão. Você pode ignorar candidatos ruins.
+7. Mesmo que o texto esteja pequeno, borrado, parcialmente cortado ou com leve diferença visual, localize a região semanticamente correta.
+8. Se houver mais de um bloco parecido, escolha o que melhor combina com a instrução do usuário e com a hierarquia visual da peça.
+9. Evite caixas excessivamente grandes. Prefira a menor área segura que permita editar sem afetar o restante.
 """
 
     user_text = (
@@ -556,7 +599,7 @@ Regras:
         f"Novo texto esperado: {replacement['new_text']}\n"
         f"Dimensões da imagem: {width}x{height}\n"
         f"Candidatos locais detectados por visão computacional: {json.dumps(candidate_summary, ensure_ascii=False)}\n"
-        "Localize a região exata e estime o estilo visual necessário para uma edição localizada profissional."
+        "Localize a região exata. Considere a semântica do pedido, a hierarquia visual e os candidatos detectados. Estime também o estilo visual necessário para uma edição localizada profissional."
     )
 
     base_messages = [
@@ -638,6 +681,25 @@ def should_use_localized_edit(analysis: Optional[Dict[str, Any]]) -> bool:
     if confidence >= 0.48 and refined and mode == "two_pass_localized":
         return bool(text_bbox or bbox)
     return False
+
+
+def should_use_local_text_render(
+    analysis: Optional[Dict[str, Any]],
+    instruction_info: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if not analysis:
+        return False
+    instruction_info = instruction_info or {}
+    if not instruction_info.get("is_pure_text_edit"):
+        return False
+    confidence = float(analysis.get("confidence", 0.0) or 0.0)
+    operation = (analysis.get("operation") or "").lower()
+    text_bbox = analysis.get("text_bbox") or analysis.get("bbox")
+    if operation not in {"text_replace", "button_text_replace"}:
+        return False
+    if not text_bbox:
+        return False
+    return confidence >= 0.58
 
 
 def build_mask_from_analysis(
@@ -744,7 +806,7 @@ def _fit_text(
         tw = bounds[2] - bounds[0]
         th = bounds[3] - bounds[1]
         spacing = max(2, int(getattr(candidate, 'size', mid) * 0.12))
-        fits = tw <= bw * 0.94 and th <= bh * 0.90 and len(lines) <= (2 if multiline else 1)
+        fits = tw <= bw * 0.94 and th <= bh * 0.90 and len(lines) <= (3 if multiline else 1)
         if fits:
             best_font = candidate
             best_bounds = bounds
@@ -849,7 +911,7 @@ def render_local_text_fallback(
             return None
 
         # Improve typography using measured layout and multiline fallback for longer replacements.
-        multiline = len(text) > 18 and (text_box[2] - text_box[0]) / max(1, text_box[3] - text_box[1]) < 3.2
+        multiline = len(text) > 14 or (text_box[2] - text_box[0]) / max(1, text_box[3] - text_box[1]) < 3.6
         overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         _draw_text_with_effects(overlay, text, text_box, style, multiline=multiline)
         image.alpha_composite(overlay)

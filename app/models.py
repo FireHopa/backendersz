@@ -123,6 +123,7 @@ class BusinessCore(SQLModel, table=True):
 
     knowledge_text: str = Field(default="")
     knowledge_files_json: str = Field(default="[]")
+    skybob: str = Field(default="")
 
     updated_at: datetime = Field(default_factory=utcnow)
 

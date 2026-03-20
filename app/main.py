@@ -50,7 +50,7 @@ from .schemas import (
     CompetitionFindOut,
     LinkedInConnectIn
 )
-from .ai import build_robot_from_briefing, chat_with_robot, transcribe_audio, find_competitors, build_competition_result, authority_assistant, run_authority_agent
+from .ai import build_robot_from_briefing, chat_with_robot, transcribe_audio, find_competitors, build_competition_result, authority_assistant, run_authority_agent, suggest_video_format_for_theme, generate_skybob_study
 
 from .deps import get_current_user
 from .auth import router as auth_router
@@ -61,6 +61,18 @@ class SuggestThemesRequest(BaseModel):
     agent_key: str
     task: str
     nucleus: dict
+
+
+class SuggestVideoFormatRequest(BaseModel):
+    agent_key: str
+    theme: str
+    nucleus: dict
+
+
+class SkyBobRunRequest(BaseModel):
+    nucleus: dict
+    preferences: Optional[dict] = None
+    previous_study: Optional[dict] = None
 
 
 app = FastAPI(title="Authority Robot Panel API")
@@ -908,6 +920,36 @@ def authority_agents_suggest_themes(payload: SuggestThemesRequest, session: Sess
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+
+@app.post("/api/skybob/run")
+def skybob_run(payload: SkyBobRunRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    nucleus = _normalize_nucleus(payload.nucleus or {})
+
+    global_robot = session.exec(select(Robot).where(Robot.public_id == "business-core-global")).first()
+    if global_robot:
+        core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == global_robot.id)).first()
+        if core and getattr(core, "knowledge_text", None):
+            nucleus["conhecimento_anexado"] = core.knowledge_text
+
+    try:
+        study = generate_skybob_study(nucleus, preferences=payload.preferences or {}, previous_study=payload.previous_study or {})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if global_robot:
+        core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == global_robot.id)).first()
+        if not core:
+            core = BusinessCore(robot_id=global_robot.id)
+            session.add(core)
+            session.flush()
+        core.skybob = study.get("serialized_text") or ""
+        core.updated_at = datetime.utcnow()
+        session.add(core)
+        session.commit()
+
+    return study
 
 # ==========================================
 # ROTAS DO LINKEDIN OAUTH2

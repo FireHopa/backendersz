@@ -14,7 +14,9 @@ from PIL import Image, ImageOps, ImageChops, UnidentifiedImageError
 from .image_local_edit import (
     analyze_region_with_openai,
     build_mask_from_analysis,
+    extract_edit_instruction_info,
     render_local_text_fallback,
+    should_use_local_text_render,
     should_use_localized_edit,
 )
 from fastapi import APIRouter, Depends, File, Form, UploadFile
@@ -1161,6 +1163,27 @@ Restrições fortes:
     return _clamp_text(final_prompt, 7000)
 
 
+def _build_localized_prompt_appendix(
+    localized_analysis: Optional[Dict[str, Any]],
+    instruction_info: Optional[Dict[str, Any]] = None,
+) -> str:
+    if not localized_analysis:
+            return "\n".join(lines)
+
+
+def _build_edit_attempt_plan(
+    instruction_info: Dict[str, Any],
+    localized_analysis: Optional[Dict[str, Any]],
+    localized_mode: bool,
+) -> Dict[str, Any]:
+    use_local_render_first = should_use_local_text_render(localized_analysis, instruction_info)
+    return {
+        "use_local_render_first": use_local_render_first,
+        "call_openai_edit": not use_local_render_first,
+        "reason": "text_replace_deterministic" if use_local_render_first else ("masked_openai_edit" if localized_mode else "full_openai_edit"),
+    }
+
+
 async def _edit_openai_image(
     client: httpx.AsyncClient,
     image_bytes: bytes,
@@ -1501,6 +1524,7 @@ async def image_engine_edit_stream(
                     "target_dimensions": {"width": requested_dimensions[0], "height": requested_dimensions[1]} if requested_dimensions else None,
                 })
 
+                instruction_info = extract_edit_instruction_info(body.instrucoes_edicao)
                 localized_analysis = None
                 localized_mask = None
                 localized_mode = False
@@ -1519,53 +1543,83 @@ async def image_engine_edit_stream(
                         localized_mask = build_mask_from_analysis(image_bytes, localized_analysis)
                         localized_mode = localized_mask is not None
                 except Exception as region_exc:
-                    localized_warning = f"Falha na detecção localizada. Seguindo com fallback seguro. Detalhe: {str(region_exc)}"
+                    localized_warning = f"Falha na detecção localizada. Seguindo com edição conservadora. Detalhe: {str(region_exc)}"
 
-                if localized_mode:
+                attempt_plan = _build_edit_attempt_plan(
+                    instruction_info=instruction_info,
+                    localized_analysis=localized_analysis,
+                    localized_mode=localized_mode,
+                )
+
+                if attempt_plan["use_local_render_first"]:
+                    yield _sse({
+                        "status": "Texto identificado com boa confiança. Aplicando edição local determinística para evitar corte, reconstrução indevida e perda de layout.",
+                        "progress": 62,
+                        "localized_analysis": localized_analysis,
+                        "localized_mode": localized_mode,
+                        "warning": localized_warning,
+                        "attempt_plan": attempt_plan,
+                    })
+                elif localized_mode:
                     yield _sse({
                         "status": "Área localizada com sucesso. Aplicando edição mascarada para preservar o restante da imagem.",
                         "progress": 62,
                         "localized_analysis": localized_analysis,
                         "localized_mode": True,
                         "warning": localized_warning,
+                        "attempt_plan": attempt_plan,
                     })
                 else:
                     yield _sse({
-                        "status": "Não foi possível garantir uma área segura. Aplicando o fallback de edição padrão com preservação reforçada.",
+                        "status": "Não foi possível garantir uma área segura com máscara. Aplicando edição global mais conservadora, mantendo a peça original como referência dominante.",
                         "progress": 62,
                         "localized_analysis": localized_analysis,
                         "localized_mode": False,
                         "warning": localized_warning,
+                        "attempt_plan": attempt_plan,
                     })
 
-                try:
-                    result = await _edit_openai_image(
-                        client=client,
-                        image_bytes=image_bytes,
-                        filename=image_filename,
-                        content_type=image_content_type,
-                        final_prompt=final_prompt,
-                        aspect_ratio=engine_aspect_ratio,
-                        quality=openai_quality,
-                        openai_key=openai_key,
-                        openai_size=openai_size,
-                        mask_bytes=localized_mask,
-                        input_fidelity="high",
-                    )
-                except Exception as edit_exc:
-                    if localized_mode:
-                        fallback_bytes = render_local_text_fallback(image_bytes=image_bytes, analysis=localized_analysis or {})
-                        if fallback_bytes:
-                            result = {
-                                "engine_id": "local_structured_edit",
-                                "motor": "Edição Local Estruturada",
-                                "url": _data_uri_from_b64(base64.b64encode(fallback_bytes).decode("utf-8"), "image/png"),
-                                "raw": {"fallback_reason": str(edit_exc)},
-                            }
+                result = None
+                if attempt_plan["use_local_render_first"]:
+                    local_bytes = render_local_text_fallback(image_bytes=image_bytes, analysis=localized_analysis or {})
+                    if local_bytes:
+                        result = {
+                            "engine_id": "local_structured_edit",
+                            "motor": "Edição Local Estruturada",
+                            "url": _data_uri_from_b64(base64.b64encode(local_bytes).decode("utf-8"), "image/png"),
+                            "raw": {"strategy": attempt_plan["reason"]},
+                        }
+
+                if result is None:
+                    final_prompt_for_edit = final_prompt + _build_localized_prompt_appendix(localized_analysis, instruction_info)
+                    try:
+                        result = await _edit_openai_image(
+                            client=client,
+                            image_bytes=image_bytes,
+                            filename=image_filename,
+                            content_type=image_content_type,
+                            final_prompt=final_prompt_for_edit,
+                            aspect_ratio=engine_aspect_ratio,
+                            quality=openai_quality,
+                            openai_key=openai_key,
+                            openai_size=openai_size,
+                            mask_bytes=localized_mask,
+                            input_fidelity="high",
+                        )
+                    except Exception as edit_exc:
+                        if localized_analysis:
+                            fallback_bytes = render_local_text_fallback(image_bytes=image_bytes, analysis=localized_analysis or {})
+                            if fallback_bytes:
+                                result = {
+                                    "engine_id": "local_structured_edit",
+                                    "motor": "Edição Local Estruturada",
+                                    "url": _data_uri_from_b64(base64.b64encode(fallback_bytes).decode("utf-8"), "image/png"),
+                                    "raw": {"fallback_reason": str(edit_exc), "strategy": "openai_failed_then_local"},
+                                }
+                            else:
+                                raise
                         else:
                             raise
-                    else:
-                        raise
 
                 result = await _apply_postprocess_if_needed(client, result, requested_dimensions)
 
@@ -1579,6 +1633,7 @@ async def image_engine_edit_stream(
                     },
                     "localized_mode": localized_mode,
                     "localized_analysis": localized_analysis,
+                    "attempt_plan": attempt_plan,
                 })
 
                 yield _sse({
@@ -1595,6 +1650,7 @@ async def image_engine_edit_stream(
                     "final_prompt": final_prompt,
                     "localized_mode": localized_mode,
                     "localized_analysis": localized_analysis,
+                    "attempt_plan": attempt_plan,
                     "final_results": [
                         {
                             "engine_id": result["engine_id"],

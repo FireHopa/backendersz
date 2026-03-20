@@ -58,6 +58,7 @@ def _ensure_sqlite_columns() -> None:
             "google_business_location_store_code": "TEXT",
             "google_business_location_category": "TEXT",
             "google_business_locations_json": "TEXT",
+            "skybob": "TEXT",
         }
         for column, sql_type in wanted.items():
             if column not in existing:

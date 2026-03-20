@@ -149,7 +149,7 @@ def _call_chat_json(
     messages.append({"role": "user", "content": user_content})
 
     resp = client.chat.completions.create(
-        model=gpt-5.4,
+        model=OPENAI_MODEL,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
@@ -1992,6 +1992,381 @@ def _authority_script_output_contract(agent_key: str, task_profile: Dict[str, st
     }
 
 
+
+def _value_from_aliases(data: Dict[str, Any], keys: List[str]) -> Any:
+    for key in keys:
+        if key in data:
+            value = data.get(key)
+            if value in (None, "", [], {}):
+                continue
+            return value
+    return None
+
+
+def _markdown_from_any(value: Any, *, heading: str | None = None, max_depth: int = 2) -> str:
+    def _render(raw: Any, depth: int = 0) -> str:
+        if raw is None:
+            return ""
+        if isinstance(raw, str):
+            return _trim_text(raw)
+        if isinstance(raw, (int, float, bool)):
+            return str(raw)
+        if depth >= max_depth:
+            return _trim_text(raw)
+        if isinstance(raw, list):
+            lines: List[str] = []
+            for item in raw:
+                rendered = _render(item, depth + 1)
+                if rendered:
+                    if "\n" in rendered:
+                        lines.append(f"- {rendered}")
+                    else:
+                        lines.append(f"- {rendered}")
+            return "\n".join(lines)
+        if isinstance(raw, dict):
+            lines = []
+            for key, item in raw.items():
+                rendered = _render(item, depth + 1)
+                if not rendered:
+                    continue
+                pretty_key = str(key).replace("_", " ").strip().capitalize()
+                if isinstance(item, (list, dict)):
+                    lines.append(f"**{pretty_key}**\n{rendered}")
+                else:
+                    lines.append(f"**{pretty_key}:** {rendered}")
+            return "\n\n".join(lines)
+        return _trim_text(raw)
+
+    body = _render(value).strip()
+    if not body:
+        return ""
+    if heading:
+        return f"### {heading}\n{body}"
+    return body
+
+
+def _coerce_text_list_from_any(value: Any, *, max_items: int = 10, max_chars: int = 220) -> List[str]:
+    if isinstance(value, list):
+        return _coerce_string_list(value, max_items=max_items, max_chars=max_chars)
+
+    text = _trim_text(value)
+    if not text:
+        return []
+
+    pieces = re.split(r"\n+|(?:^|\s)[•\-]\s+|\s*;\s*|\s*\|\s*", text)
+    cleaned: List[str] = []
+    for piece in pieces:
+        item = _trim_text(piece, max_chars=max_chars)
+        if not item:
+            continue
+        cleaned.append(item)
+        if len(cleaned) >= max_items:
+            break
+
+    return cleaned
+
+
+def _normalize_service_card_items(value: Any) -> List[JsonDict]:
+    items: List[JsonDict] = []
+
+    if isinstance(value, dict):
+        if isinstance(value.get("items"), list):
+            value = value.get("items")
+        else:
+            value = [
+                {"nome": key, "descricao": item}
+                for key, item in value.items()
+            ]
+
+    if not isinstance(value, list):
+        value = _coerce_text_list_from_any(value, max_items=8, max_chars=80)
+
+    for raw in value[:20]:
+        if isinstance(raw, str):
+            nome = _trim_text(raw, max_chars=56)
+            if not nome:
+                continue
+            items.append({
+                "nome": nome,
+                "descricao": "Explique com clareza o que este destaque precisa conter, por que existe e como ajuda a pessoa a entender ou avançar.",
+                "palavras_chave": [],
+            })
+            continue
+
+        if not isinstance(raw, dict):
+            continue
+
+        nome = _trim_text(
+            raw.get("nome")
+            or raw.get("titulo")
+            or raw.get("name")
+            or raw.get("label"),
+            max_chars=56,
+        )
+        descricao = _trim_text(
+            raw.get("descricao")
+            or raw.get("texto")
+            or raw.get("description")
+            or raw.get("resumo"),
+            max_chars=220,
+        )
+        palavras_chave = _coerce_text_list_from_any(
+            raw.get("palavras_chave")
+            or raw.get("keywords")
+            or raw.get("tags")
+            or raw.get("termos"),
+            max_items=12,
+            max_chars=56,
+        )
+
+        if not nome and not descricao:
+            continue
+
+        items.append({
+            "nome": nome or "Destaque",
+            "descricao": descricao or "não informado",
+            "palavras_chave": palavras_chave,
+        })
+
+    return items
+
+
+def _normalize_response_variation_items(value: Any, *, max_items: int = 10) -> List[str]:
+    if isinstance(value, dict):
+        for key in ["items", "variacoes", "legendas", "frases", "responses", "opcoes"]:
+            if key in value:
+                value = value.get(key)
+                break
+    return _coerce_text_list_from_any(value, max_items=max_items, max_chars=420)
+
+
+def _normalize_timeline_steps(value: Any) -> List[str]:
+    if isinstance(value, dict):
+        for key in ["passos", "items", "etapas", "ordem", "sequencia"]:
+            if key in value:
+                value = value.get(key)
+                break
+    if isinstance(value, list):
+        out: List[str] = []
+        for idx, item in enumerate(value[:12], 1):
+            if isinstance(item, dict):
+                rendered = _trim_text(item.get("titulo") or item.get("passo") or item.get("texto") or _markdown_from_any(item))
+            else:
+                rendered = _trim_text(item)
+            if not rendered:
+                continue
+            if not re.match(r"^\d+[.)-]", rendered):
+                rendered = f"{idx}. {rendered}"
+            out.append(rendered)
+        return out
+    return _coerce_text_list_from_any(value, max_items=12, max_chars=220)
+
+
+def _normalize_faq_items(value: Any) -> List[JsonDict]:
+    if isinstance(value, dict):
+        for key in ["perguntas", "items", "faq", "duvidas"]:
+            if key in value:
+                value = value.get(key)
+                break
+
+    items: List[JsonDict] = []
+    if isinstance(value, list):
+        for raw in value[:10]:
+            if isinstance(raw, dict):
+                pergunta = _trim_text(raw.get("pergunta") or raw.get("question") or raw.get("titulo"))
+                resposta = _trim_text(raw.get("resposta") or raw.get("answer") or raw.get("texto"))
+                if pergunta and resposta:
+                    items.append({"pergunta": pergunta, "resposta": resposta})
+            elif isinstance(raw, str) and ":" in raw:
+                pergunta, resposta = raw.split(":", 1)
+                pergunta = _trim_text(pergunta)
+                resposta = _trim_text(resposta)
+                if pergunta and resposta:
+                    items.append({"pergunta": pergunta, "resposta": resposta})
+    return items
+
+
+def _normalize_blocks_from_root_sections(data: JsonDict, title: str) -> List[JsonDict]:
+    blocks: List[JsonDict] = []
+
+    analysis = _value_from_aliases(data, [
+        "analise_estrategica",
+        "analise_do_tema",
+        "analise_do_perfil",
+        "analise",
+        "leitura_estrategica",
+        "diagnostico",
+    ])
+    if analysis:
+        markdown = _markdown_from_any(analysis, heading="Análise estratégica")
+        if markdown:
+            blocks.append({"tipo": "markdown", "conteudo": {"texto": markdown}})
+
+    highlights_structure = _value_from_aliases(data, [
+        "estrutura_ideal_dos_destaques",
+        "estrutura_dos_destaques",
+        "destaques_ideais",
+        "destaques_recomendados",
+        "estrutura_ideal",
+    ])
+    service_items = _normalize_service_card_items(highlights_structure)
+    if service_items:
+        blocks.append({
+            "tipo": "service_cards",
+            "conteudo": {
+                "titulo": "Estrutura ideal dos Destaques",
+                "items": service_items,
+            },
+        })
+
+    order = _value_from_aliases(data, [
+        "ordem_recomendada",
+        "sequencia_recomendada",
+        "ordem",
+        "sequencia",
+    ])
+    timeline_steps = _normalize_timeline_steps(order)
+    if timeline_steps:
+        blocks.append({"tipo": "timeline", "conteudo": {"passos": timeline_steps}})
+
+    captions_structure = _value_from_aliases(data, [
+        "estrutura_ideal_da_legenda",
+        "estrutura_da_legenda",
+        "estrutura_da_copy",
+        "estrutura",
+    ])
+    if captions_structure:
+        markdown = _markdown_from_any(captions_structure, heading="Estrutura ideal")
+        if markdown:
+            blocks.append({"tipo": "markdown", "conteudo": {"texto": markdown}})
+
+    captions = _value_from_aliases(data, [
+        "legendas_prontas",
+        "legendas",
+        "variacoes_de_legenda",
+        "copies_prontas",
+    ])
+    caption_items = _normalize_response_variation_items(captions, max_items=8)
+    if caption_items:
+        blocks.append({
+            "tipo": "response_variations",
+            "conteudo": {"titulo": "Legendas prontas", "items": caption_items},
+        })
+
+    closing_phrases = _value_from_aliases(data, [
+        "frases_finais_de_engajamento",
+        "frases_finais",
+        "ctas_finais",
+        "chamadas_finais",
+    ])
+    closing_items = _normalize_response_variation_items(closing_phrases, max_items=12)
+    if closing_items:
+        blocks.append({
+            "tipo": "response_variations",
+            "conteudo": {"titulo": "Frases finais de engajamento", "items": closing_items},
+        })
+
+    keywords = _value_from_aliases(data, [
+        "palavras_chave_estrategicas",
+        "palavras_chave",
+        "keywords",
+        "termos_estrategicos",
+    ])
+    keyword_items = _coerce_text_list_from_any(keywords, max_items=20, max_chars=120)
+    if keyword_items:
+        blocks.append({
+            "tipo": "keyword_list",
+            "conteudo": {
+                "titulo": "Palavras-chave estratégicas",
+                "limite_por_item": "curtas e fáceis de reaproveitar",
+                "items": keyword_items,
+            },
+        })
+
+    bio_principal = _value_from_aliases(data, [
+        "bio_principal",
+        "bio_sugerida",
+        "bio",
+        "headline",
+        "descricao_principal",
+    ])
+    if bio_principal:
+        markdown = _markdown_from_any(bio_principal, heading="Bio principal")
+        if markdown:
+            blocks.append({"tipo": "markdown", "conteudo": {"texto": markdown}})
+
+    bio_variations = _value_from_aliases(data, [
+        "variacoes_de_bio",
+        "variacoes",
+        "opcoes_de_bio",
+        "bios_alternativas",
+    ])
+    bio_items = _normalize_response_variation_items(bio_variations, max_items=6)
+    if bio_items:
+        blocks.append({
+            "tipo": "response_variations",
+            "conteudo": {"titulo": "Variações prontas", "items": bio_items},
+        })
+
+    faq_items = _normalize_faq_items(_value_from_aliases(data, [
+        "faq",
+        "duvidas_frequentes",
+        "perguntas_frequentes",
+        "objecoes",
+    ]))
+    if faq_items:
+        blocks.append({"tipo": "faq", "conteudo": {"perguntas": faq_items}})
+
+    visual_direction = _value_from_aliases(data, [
+        "direcao_visual_das_capas",
+        "direcao_visual",
+        "capas",
+        "direcao_das_capas",
+    ])
+    if visual_direction:
+        text = _markdown_from_any(visual_direction)
+        if text:
+            blocks.append({
+                "tipo": "highlight",
+                "conteudo": {"titulo": "Direção visual", "texto": text, "icone": "star"},
+            })
+
+    final_recommendation = _value_from_aliases(data, [
+        "recomendacao_final",
+        "recomendacao",
+        "conclusao",
+        "direcionamento_final",
+    ])
+    if final_recommendation:
+        text = _markdown_from_any(final_recommendation)
+        if text:
+            blocks.append({
+                "tipo": "highlight",
+                "conteudo": {"titulo": "Recomendação final", "texto": text, "icone": "check"},
+            })
+
+    if blocks:
+        return blocks
+
+    ignored_keys = {"titulo_da_tela", "blocos"}
+    generic_blocks: List[JsonDict] = []
+    for key, value in data.items():
+        if key in ignored_keys or value in (None, "", [], {}):
+            continue
+        heading = str(key).replace("_", " ").strip().capitalize()
+        if isinstance(value, list):
+            list_items = _coerce_text_list_from_any(value, max_items=10, max_chars=220)
+            if not list_items:
+                continue
+            generic_blocks.append({"tipo": "timeline", "conteudo": {"passos": list_items}})
+            continue
+        rendered = _markdown_from_any(value, heading=heading)
+        if rendered:
+            generic_blocks.append({"tipo": "markdown", "conteudo": {"texto": rendered}})
+
+    return generic_blocks
+
+
 def _normalize_authority_output(data: JsonDict) -> JsonDict:
     if all(key in data for key in [
         "analise_do_tema",
@@ -2047,97 +2422,101 @@ def _normalize_authority_output(data: JsonDict) -> JsonDict:
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        tipo = _trim_text(block.get("tipo")).lower()
+
+        tipo = _trim_text(block.get("tipo") or block.get("type")).lower()
         conteudo = block.get("conteudo")
+        if conteudo is None:
+            conteudo = block.get("content")
+
         if tipo not in {"markdown", "highlight", "timeline", "quote", "faq", "keyword_list", "service_cards", "response_variations"}:
-            continue
-        if not isinstance(conteudo, dict):
             continue
 
         if tipo == "markdown":
-            texto = _trim_text(conteudo.get("texto"))
+            texto = _trim_text(
+                conteudo.get("texto")
+                if isinstance(conteudo, dict)
+                else conteudo
+            ) or _trim_text(block.get("texto") or block.get("markdown") or block.get("body"))
             if not texto:
                 continue
             normalized_blocks.append({"tipo": tipo, "conteudo": {"texto": texto}})
             continue
 
         if tipo == "keyword_list":
-            items = _coerce_string_list(conteudo.get("items"), max_items=60, max_chars=120)
+            source = conteudo if isinstance(conteudo, dict) else block
+            items = _coerce_text_list_from_any(
+                source.get("items")
+                or source.get("palavras_chave")
+                or source.get("keywords")
+                or source.get("lista"),
+                max_items=60,
+                max_chars=120,
+            )
             if not items:
                 continue
-            titulo_kw = _trim_text(conteudo.get("titulo")) or "Palavras-chave"
-            limite = _trim_text(conteudo.get("limite_por_item")) or ""
+            titulo_kw = _trim_text(source.get("titulo") or source.get("title")) or "Palavras-chave"
+            limite = _trim_text(source.get("limite_por_item") or source.get("limit")) or ""
             normalized_blocks.append({"tipo": tipo, "conteudo": {"titulo": titulo_kw, "limite_por_item": limite, "items": items}})
             continue
 
         if tipo == "service_cards":
-            raw_items = conteudo.get("items")
-            service_items = []
-            if isinstance(raw_items, list):
-                for item in raw_items[:20]:
-                    if not isinstance(item, dict):
-                        continue
-                    nome = _trim_text(item.get("nome"), max_chars=56)
-                    descricao = _trim_text(item.get("descricao"), max_chars=220)
-                    palavras = _coerce_string_list(item.get("palavras_chave"), max_items=12, max_chars=56)
-                    if not nome and not descricao:
-                        continue
-                    service_items.append({
-                        "nome": nome or "Serviço",
-                        "descricao": descricao or "não informado",
-                        "palavras_chave": palavras,
-                    })
+            source = conteudo if isinstance(conteudo, dict) else block
+            service_items = _normalize_service_card_items(source.get("items") if isinstance(source, dict) else source)
             if not service_items:
                 continue
-            titulo_sc = _trim_text(conteudo.get("titulo")) or "Serviços e descrições"
+            titulo_sc = _trim_text(source.get("titulo") or source.get("title")) or "Serviços e descrições"
             normalized_blocks.append({"tipo": tipo, "conteudo": {"titulo": titulo_sc, "items": service_items}})
             continue
 
         if tipo == "response_variations":
-            items = _coerce_string_list(conteudo.get("items"), max_items=8, max_chars=420)
+            source = conteudo if isinstance(conteudo, dict) else block
+            items = _normalize_response_variation_items(source, max_items=12)
             if not items:
                 continue
-            titulo_rv = _trim_text(conteudo.get("titulo")) or "Respostas sugeridas"
+            titulo_rv = _trim_text(source.get("titulo") or source.get("title")) or "Respostas sugeridas"
             normalized_blocks.append({"tipo": tipo, "conteudo": {"titulo": titulo_rv, "items": items}})
             continue
 
         if tipo == "highlight":
-            titulo = _trim_text(conteudo.get("titulo")) or "Destaque"
-            texto_hl = _trim_text(conteudo.get("texto")) or "não informado"
-            icone = _trim_text(conteudo.get("icone")) or "lightbulb"
+            source = conteudo if isinstance(conteudo, dict) else block
+            titulo = _trim_text(source.get("titulo") or source.get("title")) or "Destaque"
+            texto_hl = _trim_text(source.get("texto") or source.get("text") or source.get("descricao") or source.get("body")) or ""
+            if not texto_hl and isinstance(conteudo, str):
+                texto_hl = _trim_text(conteudo)
+            if not texto_hl:
+                continue
+            icone = _trim_text(source.get("icone") or source.get("icon")) or "lightbulb"
             normalized_blocks.append({"tipo": tipo, "conteudo": {"titulo": titulo, "texto": texto_hl, "icone": icone}})
             continue
 
         if tipo == "timeline":
-            passos = _coerce_string_list(conteudo.get("passos"), max_items=10, max_chars=220)
+            source = conteudo if isinstance(conteudo, dict) else block
+            passos = _normalize_timeline_steps(source)
             if not passos:
                 continue
             normalized_blocks.append({"tipo": tipo, "conteudo": {"passos": passos}})
             continue
 
         if tipo == "quote":
-            texto_quote = _trim_text(conteudo.get("texto"))
+            source = conteudo if isinstance(conteudo, dict) else block
+            texto_quote = _trim_text(source.get("texto") or source.get("text") or source.get("citacao")) or ""
+            if not texto_quote and isinstance(conteudo, str):
+                texto_quote = _trim_text(conteudo)
             if not texto_quote:
                 continue
-            autor = _trim_text(conteudo.get("autor")) or "Referência"
+            autor = _trim_text(source.get("autor") or source.get("author")) or "Referência"
             normalized_blocks.append({"tipo": tipo, "conteudo": {"autor": autor, "texto": texto_quote}})
             continue
 
         if tipo == "faq":
-            perguntas = conteudo.get("perguntas")
-            items: List[JsonDict] = []
-            if isinstance(perguntas, list):
-                for item in perguntas[:8]:
-                    if not isinstance(item, dict):
-                        continue
-                    pergunta = _trim_text(item.get("pergunta"))
-                    resposta = _trim_text(item.get("resposta"))
-                    if not pergunta or not resposta:
-                        continue
-                    items.append({"pergunta": pergunta, "resposta": resposta})
+            source = conteudo if isinstance(conteudo, dict) else block
+            items = _normalize_faq_items(source)
             if not items:
                 continue
             normalized_blocks.append({"tipo": tipo, "conteudo": {"perguntas": items}})
+
+    if not normalized_blocks:
+        normalized_blocks = _normalize_blocks_from_root_sections(data, title)
 
     if not normalized_blocks:
         fallback_chunks = []
@@ -2249,14 +2628,22 @@ PRIORIDADES DE EXECUÇÃO:
         "output_contract": _authority_script_output_contract(agent_key, task_profile) if is_script_task else _authority_output_contract(agent_key, task_profile),
     }
 
-    data = _call_chat_json(
-        system=semantic_system,
-        user=user_payload,
-        temperature=0.45 if is_script_task else 0.35,
-        max_tokens=DEFAULT_AUTHORITY_AGENT_MAX_TOKENS,
-    )
-    normalized = _normalize_authority_output(data)
+    try:
+        data = _call_chat_json(
+            system=semantic_system,
+            user=user_payload,
+            temperature=0.45 if is_script_task else 0.35,
+            max_tokens=DEFAULT_AUTHORITY_AGENT_MAX_TOKENS,
+        )
+        normalized = _normalize_authority_output(data)
+    except Exception:
+        normalized = _normalized_failure_output(_trim_text(requested_task) or "Conteúdo gerado")
+
+    if agent_key == "instagram" and task_profile.get("family") == "perfil" and _is_structured_failure_output(normalized):
+        return _json_dumps(_build_instagram_bio_fallback(nucleus, requested_task, selected_theme))
+
     return _json_dumps(normalized)
+
 
 
 VIDEO_FORMAT_LABELS = {
@@ -2272,6 +2659,22 @@ VIDEO_FORMAT_LABELS = {
     "myth_vs_reality": "Mito vs realidade",
     "comparison_a_vs_b": "Comparativo A vs B",
     "quick_diagnosis": "Diagnóstico ou opinião rápida",
+}
+
+INSTAGRAM_CONTENT_TYPE_LABELS = {
+    "reels": "reels",
+    "carrossel": "carrossel",
+    "post": "post",
+    "video_educativo": "vídeo educativo",
+    "opiniao": "opinião",
+    "react": "react",
+}
+
+INSTAGRAM_CONTENT_GOAL_LABELS = {
+    "gerar_alcance": "gerar alcance",
+    "gerar_autoridade": "gerar autoridade",
+    "gerar_conversao": "gerar conversão",
+    "gerar_debate": "gerar debate",
 }
 
 
@@ -2372,6 +2775,417 @@ Regras:
     return normalized
 
 
+def _instagram_content_type_label(value: str) -> str:
+    clean = _trim_text(value)
+    return INSTAGRAM_CONTENT_TYPE_LABELS.get(clean, clean or "não informado")
+
+
+def _instagram_content_goal_label(value: str) -> str:
+    clean = _trim_text(value)
+    return INSTAGRAM_CONTENT_GOAL_LABELS.get(clean, clean or "não informado")
+
+
+def _split_nucleus_items(value: Any, max_items: int = 8) -> List[str]:
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = re.split(r"[\n;,•]+", str(value or ""))
+    cleaned: List[str] = []
+    seen = set()
+    for item in raw_items:
+        clean = _trim_text(item, max_chars=80)
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(clean)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
+
+def _normalized_failure_output(title: str = "Conteúdo gerado") -> Dict[str, Any]:
+    return {
+        "titulo_da_tela": title,
+        "blocos": [{"tipo": "markdown", "conteudo": {"texto": "Não foi possível estruturar o conteúdo em blocos válidos."}}],
+    }
+
+
+def _is_structured_failure_output(data: Dict[str, Any]) -> bool:
+    if not isinstance(data, dict):
+        return True
+    blocks = data.get("blocos")
+    if not isinstance(blocks, list) or not blocks:
+        return True
+    if len(blocks) != 1:
+        return False
+    block = blocks[0]
+    if not isinstance(block, dict) or _trim_text(block.get("tipo")).lower() != "markdown":
+        return False
+    conteudo = block.get("conteudo")
+    if not isinstance(conteudo, dict):
+        return False
+    text = _trim_text(conteudo.get("texto")).lower()
+    return "não foi possível estruturar o conteúdo em blocos válidos" in text
+
+
+def _build_instagram_bio_fallback(nucleus: Dict[str, Any], requested_task: str, selected_theme: str) -> Dict[str, Any]:
+    company = _trim_text(nucleus.get("company_name")) or "sua empresa"
+    audience = _trim_text(nucleus.get("main_audience")) or "o público certo"
+    service_area = _trim_text(nucleus.get("service_area") or nucleus.get("city_state"))
+    services = _split_nucleus_items(nucleus.get("services_products"), max_items=4)
+    differentials = _split_nucleus_items(nucleus.get("real_differentials"), max_items=4)
+    instagram_ref = _trim_text(nucleus.get("instagram")) or company
+
+    service_focus = services[0] if services else "soluções com clareza"
+    secondary_service = services[1] if len(services) > 1 else "estratégia aplicada"
+    differential = differentials[0] if differentials else "prova e direção prática"
+
+    area_suffix = f" | {service_area}" if service_area else ""
+    bio_primary = f"{company} | {service_focus} para {audience}{area_suffix}. {differential.capitalize()} e foco em resultado."
+    bio_alternatives = [
+        f"Ajudamos {audience} com {service_focus}{area_suffix}. {differential.capitalize()}, sem promessa vazia.",
+        f"{service_focus.capitalize()} para {audience}. {secondary_service.capitalize()} com clareza, prova e execução.",
+        f"{company}: {service_focus} para {audience}{area_suffix}. Processo claro, decisão mais segura.",
+    ]
+
+    strategic_elements = [
+        f"Explique em uma linha quem a {company} ajuda.",
+        f"Deixe o serviço principal explícito: {service_focus}.",
+        "Troque adjetivo genérico por critério real de comparação.",
+        "Finalize com CTA simples e sem fricção.",
+    ]
+
+    keyword_items = [item for item in [company, audience, service_focus, secondary_service, service_area, differential] if item][:8]
+
+    return {
+        "titulo_da_tela": f"Bio estratégica para {instagram_ref}",
+        "blocos": [
+            {
+                "tipo": "markdown",
+                "conteudo": {
+                    "texto": (
+                        f"### Leitura estratégica\n"
+                        f"A bio precisa deixar claro, em poucos segundos, **quem a {company} ajuda**, **o que entrega** e **por que vale continuar no perfil**. "
+                        f"O foco aqui é remover ambiguidade, reforçar autoridade e facilitar entendimento imediato para {audience}."
+                    )
+                },
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Bio principal",
+                    "texto": bio_primary,
+                    "icone": "check",
+                },
+            },
+            {
+                "tipo": "response_variations",
+                "conteudo": {
+                    "titulo": "Variações prontas",
+                    "items": bio_alternatives,
+                },
+            },
+            {
+                "tipo": "timeline",
+                "conteudo": {
+                    "passos": [f"{idx + 1}. {item}" for idx, item in enumerate(strategic_elements)],
+                },
+            },
+            {
+                "tipo": "keyword_list",
+                "conteudo": {
+                    "titulo": "Palavras-chave de apoio",
+                    "limite_por_item": "curtas e fáceis de reaproveitar",
+                    "items": keyword_items,
+                },
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Recomendação final",
+                    "texto": "A melhor bio não tenta dizer tudo. Ela deixa explícito o recorte, a utilidade e o próximo passo com leitura rápida.",
+                    "icone": "lightbulb",
+                },
+            },
+        ],
+    }
+
+
+def _build_instagram_captions_fallback(nucleus: Dict[str, Any], selected_theme: str) -> Dict[str, Any]:
+    company = _trim_text(nucleus.get("company_name")) or "a marca"
+    audience = _trim_text(nucleus.get("main_audience")) or "o público certo"
+    theme = _trim_text(selected_theme) or "o tema principal"
+    content_type = _instagram_content_type_label(_trim_text(nucleus.get("content_type")))
+    goal = _instagram_content_goal_label(_trim_text(nucleus.get("content_goal")))
+    service_area = _trim_text(nucleus.get("service_area") or nucleus.get("city_state"))
+    services = _split_nucleus_items(nucleus.get("services_products"), max_items=4)
+    differentials = _split_nucleus_items(nucleus.get("real_differentials"), max_items=3)
+
+    service_focus = services[0] if services else "solução principal"
+    differential = differentials[0] if differentials else "clareza prática"
+    local_context = f" em {service_area}" if service_area else ""
+
+    if "alcance" in goal.lower():
+        cta_focus = "Comenta “quero” se esse conteúdo te ajudou a ver isso de outro jeito."
+        closing_variations = [
+            "Salva esse post para revisar antes da próxima publicação.",
+            "Manda para alguém que ainda está errando nisso.",
+            "Se fez sentido, comenta sua maior dúvida aqui.",
+            "Compartilha com quem precisa ajustar isso hoje.",
+            "Se esse ponto te pegou, salva para aplicar depois.",
+        ]
+    elif "autoridade" in goal.lower():
+        cta_focus = "Se esse raciocínio fez sentido, acompanha o perfil para aprofundar os próximos temas."
+        closing_variations = [
+            "Esse é o tipo de detalhe que separa conteúdo raso de posicionamento forte.",
+            "Autoridade não vem de volume, vem de clareza repetida com consistência.",
+            "Quem domina isso comunica melhor e converte com menos atrito.",
+            "Esse ponto parece simples, mas muda a leitura que o mercado faz de você.",
+            "Vale transformar isso em padrão e não em exceção.",
+        ]
+    elif "convers" in goal.lower():
+        cta_focus = "Se você quer aplicar isso no seu caso, chama no direct."
+        closing_variations = [
+            "Se isso já virou prioridade, me chama para entender seu cenário.",
+            "Quem quer resultado precisa sair do conteúdo genérico para decisão prática.",
+            "Se esse é o gargalo hoje, vale conversar sobre a aplicação no seu caso.",
+            "Quando fizer sentido avançar, o próximo passo está no direct.",
+            "Conteúdo bom abre caminho. Conversa certa move decisão.",
+        ]
+    else:
+        cta_focus = "Qual a sua leitura sobre isso? Quero ver seu ponto de vista."
+        closing_variations = [
+            "Concorda ou discorda? Quero ler sua visão.",
+            "Esse tema divide opinião porque quase ninguém olha por esse ângulo.",
+            "Tem um contraponto aqui que vale debate.",
+            "Esse assunto parece simples até a prática mostrar o contrário.",
+            "Quero saber qual parte você colocaria em discussão.",
+        ]
+
+    captions = [
+        f"{theme} parece simples, mas a maioria ainda comunica isso do jeito errado. Quando a {company} olha para esse tema, o foco não é parecer interessante — é fazer {audience} entender o valor real de {service_focus}{local_context}.",
+        f"Se o seu conteúdo sobre {theme} só informa e não movimenta percepção, falta estrutura. O caminho é abrir com contexto, mostrar o impacto prático e fechar com uma direção clara. É assim que {company} transforma atenção em {goal.lower()}.",
+        f"O erro mais comum em conteúdos sobre {theme} é falar demais e explicar de menos. Para {audience}, funciona melhor quando a mensagem mostra problema, leitura e próximo passo. Menos enfeite. Mais clareza.",
+        f"Nem todo post sobre {theme} precisa viralizar. Mas ele precisa reforçar posicionamento. Quando a mensagem conecta {theme} com {service_focus} e {differential}, o conteúdo deixa de ser esquecível e começa a construir autoridade.",
+        f"{theme} não deveria ser tratado como frase pronta. O conteúdo certo mostra recorte, intenção e consequência. Quando isso fica claro, {audience} entende mais rápido por que a {company} é levada a sério nesse assunto.",
+    ]
+
+    structure_text = (
+        f"Abra com uma leitura forte sobre **{theme}**. Em seguida, conecte isso com o contexto de **{audience}**, "
+        f"mostre impacto prático relacionado a **{service_focus}** e feche com CTA coerente para **{goal.lower()}**."
+    )
+    keywords = [item for item in [theme, audience, service_focus, differential, content_type, goal, service_area] if item][:10]
+
+    return {
+        "titulo_da_tela": f"Legendas estratégicas para {theme}",
+        "blocos": [
+            {
+                "tipo": "markdown",
+                "conteudo": {
+                    "texto": (
+                        f"### Leitura estratégica\n"
+                        f"Este conteúdo é do tipo **{content_type}** e precisa trabalhar **{goal.lower()}** sem soar genérico. "
+                        f"A legenda deve amarrar tema, recorte e utilidade real para {audience}."
+                    )
+                },
+            },
+            {
+                "tipo": "markdown",
+                "conteudo": {"texto": f"### Estrutura ideal\n{structure_text}"},
+            },
+            {
+                "tipo": "response_variations",
+                "conteudo": {"titulo": "5 legendas prontas", "items": captions},
+            },
+            {
+                "tipo": "response_variations",
+                "conteudo": {"titulo": "Frases finais de engajamento", "items": [cta_focus, *closing_variations]},
+            },
+            {
+                "tipo": "keyword_list",
+                "conteudo": {
+                    "titulo": "Palavras-chave estratégicas",
+                    "limite_por_item": "curtas e reaproveitáveis",
+                    "items": keywords,
+                },
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Recomendação final",
+                    "texto": "Antes de publicar, revise se a legenda fala como gente, sustenta o tema e termina com uma ação coerente com o objetivo do post.",
+                    "icone": "check",
+                },
+            },
+        ],
+    }
+
+
+def _is_valid_instagram_captions_output(data: Dict[str, Any]) -> bool:
+    if not isinstance(data, dict):
+        return False
+    blocks = data.get("blocos")
+    if not isinstance(blocks, list) or len(blocks) < 4:
+        return False
+
+    has_caption_variations = False
+    has_keyword_list = False
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        tipo = _trim_text(block.get("tipo")).lower()
+        conteudo = block.get("conteudo") if isinstance(block.get("conteudo"), dict) else {}
+        if tipo == "response_variations":
+            items = conteudo.get("items")
+            if isinstance(items, list) and len(items) >= 3:
+                has_caption_variations = True
+        if tipo == "keyword_list":
+            items = conteudo.get("items")
+            if isinstance(items, list) and len(items) >= 3:
+                has_keyword_list = True
+        if tipo == "markdown":
+            text = _trim_text(conteudo.get("texto")).lower()
+            if "não foi possível estruturar o conteúdo em blocos válidos" in text:
+                return False
+
+    return has_caption_variations and has_keyword_list
+
+
+def _build_instagram_highlights_fallback(nucleus: Dict[str, Any]) -> Dict[str, Any]:
+    company = _trim_text(nucleus.get("company_name")) or "a empresa"
+    audience = _trim_text(nucleus.get("main_audience")) or "o público certo"
+    service_area = _trim_text(nucleus.get("service_area") or nucleus.get("city_state"))
+    services = _split_nucleus_items(nucleus.get("services_products"), max_items=6)
+    differentials = _trim_text(nucleus.get("real_differentials"))
+    restrictions = _trim_text(nucleus.get("restrictions"))
+    proof_source = _trim_text(nucleus.get("testimonials") or nucleus.get("reviews"))
+    instagram_ref = _trim_text(nucleus.get("instagram"))
+
+    service_keywords = services[:3] or ["serviço principal", "especialidade", "solução"]
+    proof_title = "Resultados" if proof_source else "Provas"
+    cards = [
+        {
+            "nome": "Comece aqui",
+            "descricao": f"Explique em 3 a 5 stories quem a {company} ajuda, qual problema resolve, para quem é indicada e por onde a pessoa deve começar. Esse Destaque reduz fricção, melhora entendimento do perfil e ajuda pessoas e IA a interpretarem contexto, especialidade e proposta.",
+            "palavras_chave": [audience, service_area or "atendimento", company],
+        },
+        {
+            "nome": "Serviços",
+            "descricao": "Mostre os principais serviços ou produtos com nome claro, promessa realista, indicação de uso e resultado esperado. Evite nomes vagos e organize por intenção de busca, não por jargão interno.",
+            "palavras_chave": service_keywords,
+        },
+        {
+            "nome": proof_title,
+            "descricao": "Reúna antes e depois, prints, depoimentos, métricas reais, bastidores de entrega ou casos resumidos. O objetivo é provar consistência sem exagero e reforçar confiança para decisão.",
+            "palavras_chave": ["prova social", "casos reais", "resultados"],
+        },
+        {
+            "nome": "Diferenciais",
+            "descricao": f"Explique por que a {company} é escolhida: método, recorte, processo, especialidade, experiência ou posicionamento. Transforme diferenciais em critérios claros de comparação, sem autopromoção vazia.",
+            "palavras_chave": _split_nucleus_items(differentials, max_items=3) or ["método", "especialidade", "diferenciais"],
+        },
+        {
+            "nome": "Como funciona",
+            "descricao": "Mostre o passo a passo da contratação, do atendimento ou da entrega: entrada, diagnóstico, execução e próximos passos. Isso reduz objeção operacional e acelera entendimento do processo.",
+            "palavras_chave": ["processo", "etapas", "como funciona"],
+        },
+        {
+            "nome": "Dúvidas",
+            "descricao": "Responda perguntas frequentes que travam contato ou compra: prazo, preço, escopo, atendimento, região, formato e elegibilidade. Use respostas curtas, objetivas e fáceis de salvar.",
+            "palavras_chave": ["faq", "objeções", "perguntas frequentes"],
+        },
+    ]
+
+    if restrictions:
+        cards.append(
+            {
+                "nome": "Critérios",
+                "descricao": "Explique com transparência o que não está incluído, limites de atuação, perfil ideal de cliente e situações em que a solução não é indicada. Isso qualifica melhor o lead e evita desalinhamento.",
+                "palavras_chave": _split_nucleus_items(restrictions, max_items=3) or ["limites", "critérios", "qualificação"],
+            }
+        )
+
+    cards = cards[:7]
+    order = [f"{idx + 1}. {item['nome']}" for idx, item in enumerate(cards)]
+    title_ref = instagram_ref or company
+
+    return {
+        "titulo_da_tela": f"Destaques estratégicos para {title_ref}",
+        "blocos": [
+            {
+                "tipo": "markdown",
+                "conteudo": {
+                    "texto": (
+                        f"## Leitura estratégica\n"
+                        f"O perfil precisa deixar claro, em segundos, **quem a {company} ajuda**, **o que entrega** e **por que vale confiar**. "
+                        f"Os Destaques devem funcionar como uma camada fixa de contexto, prova e navegação para {audience}."
+                        + (f"\n\nContexto local ou área de atuação: **{service_area}**." if service_area else "")
+                    )
+                },
+            },
+            {
+                "tipo": "service_cards",
+                "conteudo": {
+                    "titulo": "Estrutura ideal dos Destaques",
+                    "items": cards,
+                },
+            },
+            {
+                "tipo": "timeline",
+                "conteudo": {
+                    "passos": [
+                        f"Comece por **{cards[0]['nome']}** para contextualizar rápido o perfil.",
+                        *[f"Depois use **{item['nome']}** para aprofundar utilidade, prova ou decisão." for item in cards[1:]],
+                    ]
+                },
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Direção visual das capas",
+                    "texto": "Use capas sóbrias, com no máximo 1 assunto por Destaque, nomes curtos e consistentes, ícones simples e contraste forte. A prioridade é leitura rápida, não estética confusa.",
+                    "icone": "star",
+                },
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Recomendação final",
+                    "texto": "Mantenha apenas Destaques que ajudam a pessoa a entender, confiar e avançar. Se um Destaque não posiciona, não prova ou não move para a próxima ação, ele deve sair ou ser refeito.",
+                    "icone": "check",
+                },
+            },
+        ],
+    }
+
+
+def _is_valid_instagram_highlights_output(data: Dict[str, Any]) -> bool:
+    if not isinstance(data, dict):
+        return False
+    blocks = data.get("blocos")
+    if not isinstance(blocks, list) or len(blocks) < 4:
+        return False
+
+    has_service_cards = False
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if _trim_text(block.get("tipo")) == "service_cards":
+            items = ((block.get("conteudo") or {}).get("items") if isinstance(block.get("conteudo"), dict) else None)
+            if isinstance(items, list) and len(items) >= 4:
+                has_service_cards = True
+        if _trim_text(block.get("tipo")) == "markdown":
+            text = _trim_text(((block.get("conteudo") or {}).get("texto") if isinstance(block.get("conteudo"), dict) else ""))
+            if "não foi possível estruturar o conteúdo em blocos válidos" in text.lower():
+                return False
+    return has_service_cards
+
+
 def _run_instagram_highlights_task(nucleus: Dict[str, Any]) -> Dict[str, Any]:
     system = """
 Sua missão é criar uma estrutura estratégica de Destaques para Instagram.
@@ -2379,7 +3193,7 @@ Responda SOMENTE em JSON com:
 - titulo_da_tela
 - blocos (array)
 
-Use somente tipos de bloco: markdown, highlight, service_cards.
+Use somente tipos de bloco: markdown, highlight, timeline, service_cards.
 
 Estruture em:
 1. análise estratégica
@@ -2393,11 +3207,26 @@ Para a estrutura ideal dos Destaques, use service_cards, com 4 a 7 itens e campo
 - descricao
 - palavras_chave
 
+Regras obrigatórias:
+- não devolva observações fora do JSON
+- não deixe a estrutura sem service_cards
+- os nomes dos Destaques devem ser curtos, claros e úteis
+- a ordem recomendada deve vir em timeline
+- a recomendação final deve ser um highlight
+
 Na descrição de cada item, deixe claro função estratégica, o que deve conter e como ajuda em SEO, AEO ou GEO.
 Evite nomes genéricos.
 """.strip()
     user = {"nucleus_digest": _build_nucleus_digest(nucleus or {}), "nucleus": nucleus or {}}
-    return _normalize_authority_output(_call_chat_json(system=system, user=user, temperature=0.35, max_tokens=2200))
+
+    try:
+        normalized = _normalize_authority_output(_call_chat_json(system=system, user=user, temperature=0.35, max_tokens=2200))
+        if _is_valid_instagram_highlights_output(normalized):
+            return normalized
+    except Exception:
+        pass
+
+    return _build_instagram_highlights_fallback(nucleus or {})
 
 
 def _run_instagram_captions_task(nucleus: Dict[str, Any], selected_theme: str) -> Dict[str, Any]:
@@ -2426,13 +3255,20 @@ Regras:
 """.strip()
     user = {
         "theme": selected_theme,
-        "content_type": _trim_text(nucleus.get("content_type")) or "não informado",
-        "content_goal": _trim_text(nucleus.get("content_goal")) or "não informado",
+        "content_type": _instagram_content_type_label(_trim_text(nucleus.get("content_type"))),
+        "content_goal": _instagram_content_goal_label(_trim_text(nucleus.get("content_goal"))),
         "nucleus_digest": _build_nucleus_digest(nucleus or {}),
         "nucleus": nucleus or {},
     }
-    return _normalize_authority_output(_call_chat_json(system=system, user=user, temperature=0.4, max_tokens=2600))
 
+    try:
+        normalized = _normalize_authority_output(_call_chat_json(system=system, user=user, temperature=0.4, max_tokens=2600))
+        if _is_valid_instagram_captions_output(normalized):
+            return normalized
+    except Exception:
+        pass
+
+    return _build_instagram_captions_fallback(nucleus or {}, selected_theme)
 
 def suggest_themes_for_task(agent_key: str, nucleus: Dict[str, Any], task: str) -> List[str]:
     _require_key()

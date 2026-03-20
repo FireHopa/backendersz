@@ -921,6 +921,24 @@ def authority_agents_suggest_themes(payload: SuggestThemesRequest, session: Sess
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/authority-agents/suggest-video-format")
+def authority_agents_suggest_video_format(payload: SuggestVideoFormatRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    nucleus = _normalize_nucleus(payload.nucleus or {})
+
+    global_robot = session.exec(select(Robot).where(Robot.public_id == "business-core-global")).first()
+    if global_robot:
+        core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == global_robot.id)).first()
+        if core and getattr(core, "knowledge_text", None):
+            nucleus["conhecimento_anexado"] = core.knowledge_text
+
+    try:
+        return suggest_video_format_for_theme(payload.agent_key, nucleus, payload.theme)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 @app.post("/api/skybob/run")

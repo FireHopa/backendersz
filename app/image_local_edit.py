@@ -3,13 +3,26 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import math
 import re
+import traceback
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 import numpy as np
 from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont, ImageStat
+
+# --- CONFIGURAÇÃO DE LOGGING ROBUSTO ---
+logger = logging.getLogger("image_local_edit")
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - [%(levelname)s] - %(name)s: %(message)s')
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+# ---------------------------------------
 
 try:
     import cv2  # type: ignore
@@ -259,7 +272,6 @@ def _local_text_candidates(image_bytes: bytes) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    # Secondary pass for stronger text lines
     for invert in (False, True):
         img = 255 - gray if invert else gray
         thresh = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11)
@@ -283,7 +295,6 @@ def _local_text_candidates(image_bytes: bytes) -> List[Dict[str, Any]]:
     if not candidates:
         return []
 
-    # Merge close rows into line-level candidates
     candidates.sort(key=lambda r: (r[1], r[0]))
     merged: List[Tuple[int, int, int, int]] = []
     for rect in candidates:
@@ -302,7 +313,6 @@ def _local_text_candidates(image_bytes: bytes) -> List[Dict[str, Any]]:
         if not attached:
             merged.append(rect)
 
-    # Dedupe by IoU and score
     final: List[Tuple[int, int, int, int]] = []
     for rect in sorted(merged, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]), reverse=True):
         if any(_rect_iou(rect, existing) > 0.55 for existing in final):
@@ -527,7 +537,7 @@ async def _ask_openai_for_json(
         "messages": messages,
         "temperature": 0.0,
     }
-    resp = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+    resp = await client.post("[https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions)", headers=headers, json=payload)
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
     return _parse_json_safe(content)
@@ -767,56 +777,61 @@ def _fit_text(
     font_weight: str,
     multiline: bool = False,
 ) -> Tuple[ImageFont.ImageFont, Tuple[int, int, int, int], List[str], int]:
-    bw = max(1, box[2] - box[0])
-    bh = max(1, box[3] - box[1])
-    bold = font_weight in {"semibold", "bold", "heavy"}
-    probe = ImageDraw.Draw(Image.new("RGBA", (8, 8), (0, 0, 0, 0)))
+    try:
+        bw = max(1, box[2] - box[0])
+        bh = max(1, box[3] - box[1])
+        bold = font_weight in {"semibold", "bold", "heavy"}
+        probe = ImageDraw.Draw(Image.new("RGBA", (8, 8), (0, 0, 0, 0)))
 
-    def wrap(candidate_font: ImageFont.ImageFont) -> Tuple[List[str], Tuple[int, int, int, int]]:
-        if not multiline:
-            bounds = probe.multiline_textbbox((0, 0), text, font=candidate_font, spacing=0, align="left")
-            return [text], bounds
-        words = text.split()
-        if not words:
-            bounds = probe.textbbox((0, 0), text, font=candidate_font)
-            return [text], bounds
-        lines = [words[0]]
-        for word in words[1:]:
-            trial = f"{lines[-1]} {word}".strip()
-            trial_bounds = probe.textbbox((0, 0), trial, font=candidate_font)
-            if (trial_bounds[2] - trial_bounds[0]) <= bw * 0.88:
-                lines[-1] = trial
+        def wrap(candidate_font: ImageFont.ImageFont) -> Tuple[List[str], Tuple[int, int, int, int]]:
+            font_size = getattr(candidate_font, "size", 24)
+            if not multiline:
+                bounds = probe.multiline_textbbox((0, 0), text, font=candidate_font, spacing=0, align="left")
+                return [text], bounds
+            words = text.split()
+            if not words:
+                bounds = probe.textbbox((0, 0), text, font=candidate_font)
+                return [text], bounds
+            text_lines = [words[0]]
+            for word in words[1:]:
+                trial = f"{text_lines[-1]} {word}".strip()
+                trial_bounds = probe.textbbox((0, 0), trial, font=candidate_font)
+                if (trial_bounds[2] - trial_bounds[0]) <= bw * 0.88:
+                    text_lines[-1] = trial
+                else:
+                    text_lines.append(word)
+            bounds = probe.multiline_textbbox((0, 0), "\n".join(text_lines), font=candidate_font, spacing=max(2, int(font_size * 0.14)), align="left")
+            return text_lines, bounds
+
+        min_size = max(12, int(bh * 0.18))
+        max_size = max(min_size, int(bh * (0.92 if not multiline else 0.82)))
+        best_font: ImageFont.ImageFont = _load_font(min_size, bold=bold)
+        best_bounds = probe.textbbox((0, 0), text, font=best_font)
+        best_lines = [text]
+        best_spacing = max(2, int(getattr(best_font, 'size', 24) * 0.12))
+
+        lo, hi = min_size, max_size
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = _load_font(mid, bold=bold)
+            current_lines, bounds = wrap(candidate)
+            tw = bounds[2] - bounds[0]
+            th = bounds[3] - bounds[1]
+            spacing = max(2, int(getattr(candidate, 'size', mid) * 0.12))
+            fits = tw <= bw * 0.94 and th <= bh * 0.90 and len(current_lines) <= (3 if multiline else 1)
+            if fits:
+                best_font = candidate
+                best_bounds = bounds
+                best_lines = current_lines
+                best_spacing = spacing
+                lo = mid + 1
             else:
-                lines.append(word)
-        bounds = probe.multiline_textbbox((0, 0), "\n".join(lines), font=candidate_font, spacing=max(2, int(candidate_font.size * 0.14)), align="left")
-        return lines, bounds
+                hi = mid - 1
 
-    min_size = max(12, int(bh * 0.18))
-    max_size = max(min_size, int(bh * (0.92 if not multiline else 0.82)))
-    best_font: ImageFont.ImageFont = _load_font(min_size, bold=bold)
-    best_bounds = probe.textbbox((0, 0), text, font=best_font)
-    best_lines = [text]
-    best_spacing = max(2, int(best_font.size * 0.12)) if hasattr(best_font, 'size') else 2
-
-    lo, hi = min_size, max_size
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        candidate = _load_font(mid, bold=bold)
-        lines, bounds = wrap(candidate)
-        tw = bounds[2] - bounds[0]
-        th = bounds[3] - bounds[1]
-        spacing = max(2, int(getattr(candidate, 'size', mid) * 0.12))
-        fits = tw <= bw * 0.94 and th <= bh * 0.90 and len(lines) <= (3 if multiline else 1)
-        if fits:
-            best_font = candidate
-            best_bounds = bounds
-            best_lines = lines
-            best_spacing = spacing
-            lo = mid + 1
-        else:
-            hi = mid - 1
-
-    return best_font, best_bounds, best_lines, best_spacing
+        return best_font, best_bounds, best_lines, best_spacing
+    except Exception as e:
+        logger.error(f"Erro CRÍTICO em _fit_text: {e}", exc_info=True)
+        raise
 
 
 def _draw_text_with_effects(
@@ -826,96 +841,114 @@ def _draw_text_with_effects(
     style: Dict[str, Any],
     multiline: bool,
 ) -> None:
-    font, bounds, lines, spacing = _fit_text(text, box, style.get("font_weight", "regular"), multiline=multiline)
-    draw = ImageDraw.Draw(overlay)
-    content = "\n".join(lines)
-    tw = bounds[2] - bounds[0]
-    th = bounds[3] - bounds[1]
-    bw = box[2] - box[0]
-    bh = box[3] - box[1]
-    align = (style.get("alignment") or "center").lower()
-
-    if align == "left":
-        tx = box[0] + int(bw * 0.06) - bounds[0]
-        text_align = "left"
-    elif align == "right":
-        tx = box[2] - tw - int(bw * 0.06) - bounds[0]
-        text_align = "right"
-    else:
-        tx = box[0] + (bw - tw) / 2 - bounds[0]
-        text_align = "center"
-    ty = box[1] + (bh - th) / 2 - bounds[1]
-
-    color = _hex_or_default(style.get("text_color"), "#FFFFFF")
-    stroke_width = 1 if style.get("font_weight") in {"semibold", "bold"} else 0
-    stroke_fill = None
-
-    if style.get("glow"):
-        glow = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
-        glow_draw = ImageDraw.Draw(glow)
-        glow_draw.multiline_text((tx, ty), content, font=font, fill=(255, 255, 255, 150), spacing=spacing, align=text_align)
-        glow = glow.filter(ImageFilter.GaussianBlur(radius=max(4, int(getattr(font, 'size', 24) * 0.14))))
-        overlay.alpha_composite(glow)
+    try:
+        font, bounds, text_lines, spacing = _fit_text(text, box, style.get("font_weight", "regular"), multiline=multiline)
         draw = ImageDraw.Draw(overlay)
+        content = "\n".join(text_lines)
+        tw = bounds[2] - bounds[0]
+        th = bounds[3] - bounds[1]
+        bw = box[2] - box[0]
+        bh = box[3] - box[1]
+        align = (style.get("alignment") or "center").lower()
 
-    if style.get("shadow"):
-        shadow_alpha = 120 if not style.get("glow") else 70
-        draw.multiline_text((tx + 2, ty + 2), content, font=font, fill=(0, 0, 0, shadow_alpha), spacing=spacing, align=text_align)
+        if align == "left":
+            tx = box[0] + int(bw * 0.06) - bounds[0]
+            text_align = "left"
+        elif align == "right":
+            tx = box[2] - tw - int(bw * 0.06) - bounds[0]
+            text_align = "right"
+        else:
+            tx = box[0] + (bw - tw) / 2 - bounds[0]
+            text_align = "center"
+        ty = box[1] + (bh - th) / 2 - bounds[1]
 
-    draw.multiline_text(
-        (tx, ty),
-        content,
-        font=font,
-        fill=color,
-        spacing=spacing,
-        align=text_align,
-        stroke_width=stroke_width,
-        stroke_fill=stroke_fill,
-    )
+        color = _hex_or_default(style.get("text_color"), "#FFFFFF")
+        stroke_width = 1 if style.get("font_weight") in {"semibold", "bold"} else 0
+        stroke_fill = None
+
+        if style.get("glow"):
+            glow = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
+            glow_draw = ImageDraw.Draw(glow)
+            glow_draw.multiline_text((tx, ty), content, font=font, fill=(255, 255, 255, 150), spacing=spacing, align=text_align)
+            glow_radius = max(4, int(getattr(font, 'size', 24) * 0.14))
+            glow = glow.filter(ImageFilter.GaussianBlur(radius=glow_radius))
+            overlay.alpha_composite(glow)
+            draw = ImageDraw.Draw(overlay)
+
+        if style.get("shadow"):
+            shadow_alpha = 120 if not style.get("glow") else 70
+            draw.multiline_text((tx + 2, ty + 2), content, font=font, fill=(0, 0, 0, shadow_alpha), spacing=spacing, align=text_align)
+
+        draw.multiline_text(
+            (tx, ty),
+            content,
+            font=font,
+            fill=color,
+            spacing=spacing,
+            align=text_align,
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill,
+        )
+    except Exception as e:
+        logger.error(f"Erro CRÍTICO em _draw_text_with_effects: {e}", exc_info=True)
+        raise
 
 
 def render_local_text_fallback(
     image_bytes: bytes,
     analysis: Dict[str, Any],
 ) -> Optional[bytes]:
-    with Image.open(io.BytesIO(image_bytes)) as im:
-        image = im.convert("RGBA")
-        width, height = image.size
+    logger.info("A iniciar render_local_text_fallback")
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            image = im.convert("RGBA")
+            width, height = image.size
 
-        text = (analysis.get("replacement_text") or "").strip()
-        if not text:
-            return None
+            text = (analysis.get("replacement_text") or "").strip()
+            if not text:
+                logger.warning("Nenhum texto de substituição encontrado.")
+                return None
 
-        style = analysis.get("style") or {}
-        operation = analysis.get("operation") or "text_replace"
+            style = analysis.get("style") or {}
+            operation = analysis.get("operation") or "text_replace"
 
-        bbox = _norm_box_to_px(analysis.get("bbox"), width, height)
-        text_rect = _norm_box_to_px(analysis.get("text_bbox"), width, height)
-        container_rect = _norm_box_to_px(analysis.get("container_bbox"), width, height)
-        if not (bbox or text_rect or container_rect):
-            return None
+            bbox = _norm_box_to_px(analysis.get("bbox"), width, height)
+            text_rect = _norm_box_to_px(analysis.get("text_bbox"), width, height)
+            container_rect = _norm_box_to_px(analysis.get("container_bbox"), width, height)
+            
+            logger.debug(f"Caixas convertidas - bbox: {bbox}, text_rect: {text_rect}, container_rect: {container_rect}")
+            
+            if not (bbox or text_rect or container_rect):
+                logger.warning("Nenhuma caixa (bbox, text_rect ou container_rect) válida encontrada.")
+                return None
 
-        # Preserve the original artwork whenever possible.
-        if text_rect:
-            clean_rect = _inflate_rect(text_rect, max(6, (text_rect[2] - text_rect[0]) // 8), max(6, (text_rect[3] - text_rect[1]) // 5), width, height)
-            image = _inpaint_rgba(image, clean_rect, radius=3)
-        elif bbox:
-            image = _inpaint_rgba(image, _inflate_rect(bbox, 4, 4, width, height), radius=3)
+            if text_rect:
+                clean_rect = _inflate_rect(text_rect, max(6, (text_rect[2] - text_rect[0]) // 8), max(6, (text_rect[3] - text_rect[1]) // 5), width, height)
+                image = _inpaint_rgba(image, clean_rect, radius=3)
+            elif bbox:
+                image = _inpaint_rgba(image, _inflate_rect(bbox, 4, 4, width, height), radius=3)
 
-        # When the container exists, use it only as a layout box. Do not repaint the whole button.
-        if operation == "button_text_replace" and container_rect:
-            text_box = container_rect
-        else:
-            text_box = text_rect or bbox or container_rect
-        if not text_box:
-            return None
+            if operation == "button_text_replace" and container_rect:
+                text_box = container_rect
+            else:
+                text_box = text_rect or bbox or container_rect
+                
+            if not text_box:
+                return None
 
-        # Improve typography using measured layout and multiline fallback for longer replacements.
-        multiline = len(text) > 14 or (text_box[2] - text_box[0]) / max(1, text_box[3] - text_box[1]) < 3.6
-        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        _draw_text_with_effects(overlay, text, text_box, style, multiline=multiline)
-        image.alpha_composite(overlay)
+            multiline = len(text) > 14 or (text_box[2] - text_box[0]) / max(1, text_box[3] - text_box[1]) < 3.6
+            overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            
+            logger.debug(f"A desenhar o texto: '{text}', multiline: {multiline}")
+            _draw_text_with_effects(overlay, text, text_box, style, multiline=multiline)
+            
+            image.alpha_composite(overlay)
 
-        out = io.BytesIO()
-        image.save(out, format="PNG")
-        return out.getvalue()
+            out = io.BytesIO()
+            image.save(out, format="PNG")
+            logger.info("Renderização concluída com sucesso.")
+            return out.getvalue()
+            
+    except Exception as e:
+        logger.error(f"Erro CRÍTICO na função base render_local_text_fallback: {e}", exc_info=True)
+        raise

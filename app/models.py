@@ -188,3 +188,33 @@ class AuthorityAgentRun(SQLModel, table=True):
     nucleus_json: str
     output_text: str
     created_at: datetime = Field(default_factory=utcnow, index=True)
+class BobarColumn(SQLModel, table=True):
+    __tablename__ = "bobar_column"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    name: str = Field(default="Nova coluna")
+    position: int = Field(default=0, index=True)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class BobarCard(SQLModel, table=True):
+    __tablename__ = "bobar_card"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    column_id: int = Field(foreign_key="bobar_column.id", index=True)
+
+    title: str = Field(default="Novo card")
+    card_type: str = Field(default="manual", index=True)
+    source_kind: Optional[str] = Field(default=None, index=True)
+    source_label: Optional[str] = Field(default=None)
+
+    content_text: str = Field(default="")
+    note: str = Field(default="")
+    position: int = Field(default=0, index=True)
+    structure_json: str = Field(default="{}")
+
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    updated_at: datetime = Field(default_factory=utcnow, index=True)

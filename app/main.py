@@ -50,10 +50,11 @@ from .schemas import (
     CompetitionFindOut,
     LinkedInConnectIn
 )
-from .ai import build_robot_from_briefing, chat_with_robot, transcribe_audio, find_competitors, build_competition_result, authority_assistant, run_authority_agent, suggest_video_format_for_theme, generate_skybob_study
+from .ai import build_robot_from_briefing, chat_with_robot, transcribe_audio, find_competitors, build_competition_result, authority_assistant, run_authority_agent, suggest_video_format_for_theme, generate_skybob_study, generate_skybob_catalog_analysis
 
 from .deps import get_current_user
 from .auth import router as auth_router
+from .bobar import router as bobar_router
 from pydantic import BaseModel
 
 
@@ -73,11 +74,18 @@ class SkyBobRunRequest(BaseModel):
     nucleus: dict
     preferences: Optional[dict] = None
     previous_study: Optional[dict] = None
+    catalog_analysis: Optional[dict] = None
+    mode: str = "full"
+
+
+class SkyBobCatalogRequest(BaseModel):
+    nucleus: dict
 
 
 app = FastAPI(title="Authority Robot Panel API")
 
 app.include_router(auth_router)
+app.include_router(bobar_router)
 
 
 async def extract_text_from_file(file: UploadFile) -> str:
@@ -132,20 +140,137 @@ def _startup():
     init_db()
 
 
-def _get_robot_or_404(public_id: str, session: Session, current_user: User) -> Robot:
-    if public_id == "business-core-global":
-        robot = session.exec(select(Robot).where(Robot.public_id == public_id)).first()
-        if not robot:
-            robot = Robot(
-                public_id="business-core-global",
-                title="[SISTEMA] Núcleo Global",
-                description="Armazena os ficheiros do Núcleo da Empresa.",
-                system_instructions="Não usado diretamente no chat."
-            )
-            session.add(robot)
-            session.commit()
-            session.refresh(robot)
+BUSINESS_CORE_PUBLIC_IDS = {"business-core", "business-core-global"}
+
+
+def _business_core_public_id_for_user(user_id: int) -> str:
+    return f"business-core-user-{user_id}"
+
+
+def _is_business_core_alias(public_id: str) -> bool:
+    return public_id in BUSINESS_CORE_PUBLIC_IDS
+
+
+def _is_system_business_core_robot(robot: Robot, current_user: Optional[User] = None) -> bool:
+    if not robot.public_id:
+        return False
+    if robot.public_id in BUSINESS_CORE_PUBLIC_IDS:
+        return True
+    if current_user and robot.public_id == _business_core_public_id_for_user(current_user.id):
+        return True
+    return robot.public_id.startswith("business-core-user-")
+
+
+def _copy_business_core_data(source: BusinessCore, target: BusinessCore) -> BusinessCore:
+    fields_to_copy = (
+        "company_name",
+        "city_state",
+        "service_area",
+        "main_audience",
+        "services_products",
+        "real_differentials",
+        "restrictions",
+        "reviews",
+        "testimonials",
+        "usable_links_texts",
+        "site",
+        "instagram",
+        "linkedin",
+        "youtube",
+        "tiktok",
+        "owner_name",
+        "forbidden_content",
+        "google_business_profile",
+        "knowledge_text",
+        "knowledge_files_json",
+        "skybob",
+    )
+    for field_name in fields_to_copy:
+        setattr(target, field_name, getattr(source, field_name, getattr(target, field_name, "")))
+    target.updated_at = datetime.utcnow()
+    return target
+
+
+def _try_migrate_legacy_global_business_core(session: Session, current_user: User, core: BusinessCore) -> None:
+    has_payload = any(
+        bool((getattr(core, field_name, "") or "").strip())
+        for field_name in (
+            "company_name",
+            "services_products",
+            "main_audience",
+            "real_differentials",
+            "knowledge_text",
+            "skybob",
+        )
+    )
+    if has_payload:
+        return
+
+    users = session.exec(select(User)).all()
+    if len(users) != 1 or users[0].id != current_user.id:
+        return
+
+    legacy_robot = session.exec(select(Robot).where(Robot.public_id == "business-core-global")).first()
+    if not legacy_robot:
+        return
+
+    legacy_core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == legacy_robot.id)).first()
+    if not legacy_core:
+        return
+
+    _copy_business_core_data(legacy_core, core)
+    session.add(core)
+    session.commit()
+    session.refresh(core)
+
+
+def _ensure_business_core_robot(session: Session, current_user: User) -> Robot:
+    scoped_public_id = _business_core_public_id_for_user(current_user.id)
+    robot = session.exec(
+        select(Robot).where(Robot.public_id == scoped_public_id, Robot.user_id == current_user.id)
+    ).first()
+    if robot:
         return robot
+
+    robot = Robot(
+        user_id=current_user.id,
+        public_id=scoped_public_id,
+        title="[SISTEMA] Núcleo da Empresa",
+        description="Armazena os ficheiros e estudos do Núcleo da Empresa deste utilizador.",
+        system_instructions="Não usado diretamente no chat.",
+    )
+    session.add(robot)
+    session.commit()
+    session.refresh(robot)
+    return robot
+
+
+def _get_business_core(session: Session, current_user: User, create: bool = True) -> Optional[BusinessCore]:
+    robot = _ensure_business_core_robot(session, current_user)
+    core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
+
+    if core or not create:
+        return core
+
+    core = BusinessCore(robot_id=robot.id)
+    session.add(core)
+    session.commit()
+    session.refresh(core)
+    _try_migrate_legacy_global_business_core(session, current_user, core)
+    return core
+
+
+def _inject_business_core_knowledge(nucleus: dict, session: Session, current_user: User) -> dict:
+    scoped = _normalize_nucleus(nucleus or {})
+    core = _get_business_core(session, current_user, create=True)
+    if core and getattr(core, "knowledge_text", None):
+        scoped["conhecimento_anexado"] = core.knowledge_text
+    return scoped
+
+
+def _get_robot_or_404(public_id: str, session: Session, current_user: User) -> Robot:
+    if _is_business_core_alias(public_id):
+        return _ensure_business_core_robot(session, current_user)
 
     robot = session.exec(select(Robot).where(Robot.public_id == public_id, Robot.user_id == current_user.id)).first()
     if not robot:
@@ -155,12 +280,15 @@ def _get_robot_or_404(public_id: str, session: Session, current_user: User) -> R
 
 @app.get("/api/robots", response_model=list[RobotOut])
 def list_robots(session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    robots = session.exec(
-        select(Robot)
-        .where(Robot.public_id != "business-core-global")
-        .where(Robot.user_id == current_user.id)
-        .order_by(Robot.created_at.desc())
-    ).all()
+    robots = [
+        robot
+        for robot in session.exec(
+            select(Robot)
+            .where(Robot.user_id == current_user.id)
+            .order_by(Robot.created_at.desc())
+        ).all()
+        if not _is_system_business_core_robot(robot, current_user)
+    ]
     return [
         RobotOut(
             public_id=r.public_id,
@@ -249,7 +377,9 @@ def update_robot(public_id: str, body: RobotUpdateIn, session: Session = Depends
 @app.get("/api/robots/{public_id}/business-core")
 def get_business_core(public_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     robot = _get_robot_or_404(public_id, session, current_user)
-    core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
+    core = _get_business_core(session, current_user, create=True) if _is_business_core_alias(public_id) else session.exec(
+        select(BusinessCore).where(BusinessCore.robot_id == robot.id)
+    ).first()
 
     if not core:
         core = BusinessCore(robot_id=robot.id)
@@ -263,7 +393,9 @@ def get_business_core(public_id: str, session: Session = Depends(get_session), c
 @app.patch("/api/robots/{public_id}/business-core")
 def update_business_core(public_id: str, payload: dict, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     robot = _get_robot_or_404(public_id, session, current_user)
-    core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == robot.id)).first()
+    core = _get_business_core(session, current_user, create=True) if _is_business_core_alias(public_id) else session.exec(
+        select(BusinessCore).where(BusinessCore.robot_id == robot.id)
+    ).first()
 
     if not core:
         core = BusinessCore(robot_id=robot.id)
@@ -734,13 +866,7 @@ def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depend
     if current_user.credits < 5:
         raise HTTPException(status_code=403, detail="Créditos insuficientes. Precisas de 5 créditos para executar o agente de autoridade.")
 
-    nucleus = _normalize_nucleus(payload.nucleus)
-
-    global_robot = session.exec(select(Robot).where(Robot.public_id == "business-core-global")).first()
-    if global_robot:
-        core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == global_robot.id)).first()
-        if core and getattr(core, "knowledge_text", None):
-            nucleus["conhecimento_anexado"] = core.knowledge_text
+    nucleus = _inject_business_core_knowledge(payload.nucleus, session, current_user)
 
     try:
         output = run_authority_agent(payload.agent_key, nucleus)
@@ -923,13 +1049,7 @@ def authority_agents_suggest_themes(payload: SuggestThemesRequest, session: Sess
 
 @app.post("/api/authority-agents/suggest-video-format")
 def authority_agents_suggest_video_format(payload: SuggestVideoFormatRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    nucleus = _normalize_nucleus(payload.nucleus or {})
-
-    global_robot = session.exec(select(Robot).where(Robot.public_id == "business-core-global")).first()
-    if global_robot:
-        core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == global_robot.id)).first()
-        if core and getattr(core, "knowledge_text", None):
-            nucleus["conhecimento_anexado"] = core.knowledge_text
+    nucleus = _inject_business_core_knowledge(payload.nucleus or {}, session, current_user)
 
     try:
         return suggest_video_format_for_theme(payload.agent_key, nucleus, payload.theme)
@@ -941,27 +1061,33 @@ def authority_agents_suggest_video_format(payload: SuggestVideoFormatRequest, se
 
 
 
-@app.post("/api/skybob/run")
-def skybob_run(payload: SkyBobRunRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    nucleus = _normalize_nucleus(payload.nucleus or {})
-
-    global_robot = session.exec(select(Robot).where(Robot.public_id == "business-core-global")).first()
-    if global_robot:
-        core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == global_robot.id)).first()
-        if core and getattr(core, "knowledge_text", None):
-            nucleus["conhecimento_anexado"] = core.knowledge_text
+@app.post("/api/skybob/preflight")
+def skybob_preflight(payload: SkyBobCatalogRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    nucleus = _inject_business_core_knowledge(payload.nucleus or {}, session, current_user)
 
     try:
-        study = generate_skybob_study(nucleus, preferences=payload.preferences or {}, previous_study=payload.previous_study or {})
+        return generate_skybob_catalog_analysis(nucleus)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    if global_robot:
-        core = session.exec(select(BusinessCore).where(BusinessCore.robot_id == global_robot.id)).first()
-        if not core:
-            core = BusinessCore(robot_id=global_robot.id)
-            session.add(core)
-            session.flush()
+
+@app.post("/api/skybob/run")
+def skybob_run(payload: SkyBobRunRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    nucleus = _inject_business_core_knowledge(payload.nucleus or {}, session, current_user)
+
+    try:
+        study = generate_skybob_study(
+            nucleus,
+            preferences=payload.preferences or {},
+            previous_study=payload.previous_study or {},
+            catalog_analysis=payload.catalog_analysis or None,
+            mode=payload.mode or "full",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    core = _get_business_core(session, current_user, create=True)
+    if core:
         core.skybob = study.get("serialized_text") or ""
         core.updated_at = datetime.utcnow()
         session.add(core)

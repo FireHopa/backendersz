@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import unicodedata
 import mimetypes
+from datetime import datetime
+from uuid import uuid4
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -47,6 +51,7 @@ DEFAULT_THEME_SUGGESTION_MAX_TOKENS = 6500
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
 
 _client: Optional[OpenAI] = None
+logger = logging.getLogger(__name__)
 
 
 def _require_key() -> None:
@@ -152,7 +157,7 @@ def _call_chat_json(
         model=OPENAI_MODEL,
         messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_tokens,
         response_format={"type": "json_object"},
     )
 
@@ -182,7 +187,7 @@ def _call_chat_text(
         model=OPENAI_MODEL,
         messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_tokens,
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -2755,6 +2760,17 @@ def run_authority_agent(agent_key: str, nucleus: Dict[str, Any]) -> str:
     if agent_key == "instagram" and _is_instagram_bio_task(requested_task_lower):
         return _json_dumps(_run_instagram_bio_task(nucleus, requested_task, selected_theme))
 
+    if agent_key == "tiktok" and requested_task_lower == "roteiros":
+        return _json_dumps(_run_tiktok_script_task(agent_key, nucleus, requested_task, selected_theme))
+    if agent_key == "tiktok" and "legendas estratégicas" in requested_task_lower:
+        return _json_dumps(_run_tiktok_captions_task(nucleus, selected_theme))
+    if agent_key == "tiktok" and "hooks de abertura" in requested_task_lower:
+        return _json_dumps(_run_tiktok_hooks_task(nucleus, requested_task, selected_theme))
+    if agent_key == "tiktok" and "caçador de trends" in requested_task_lower:
+        return _json_dumps(_run_tiktok_trends_task(nucleus))
+    if agent_key == "tiktok" and _is_tiktok_bio_task(requested_task_lower):
+        return _json_dumps(_run_tiktok_bio_task(nucleus, requested_task, selected_theme))
+
     is_script_task = any(term in requested_task_lower for term in [
         "roteiro",
         "reels",
@@ -2863,6 +2879,22 @@ INSTAGRAM_CONTENT_GOAL_LABELS = {
     "gerar_debate": "gerar debate",
 }
 
+TIKTOK_CONTENT_TYPE_LABELS = {
+    "video_curto": "vídeo curto",
+    "trend_adaptada": "trend adaptada ao nicho",
+    "educativo": "educativo",
+    "opiniao": "opinião",
+    "react": "react",
+    "storytelling": "storytelling",
+}
+
+TIKTOK_CONTENT_GOAL_LABELS = {
+    "gerar_descoberta": "gerar descoberta",
+    "gerar_autoridade": "gerar autoridade",
+    "gerar_conversao": "gerar conversão",
+    "gerar_interacao": "gerar interação",
+}
+
 
 def _video_format_label(value: str) -> str:
     return VIDEO_FORMAT_LABELS.get(_trim_text(value), _trim_text(value) or "não informado")
@@ -2874,8 +2906,22 @@ def suggest_video_format_for_theme(agent_key: str, nucleus: Dict[str, Any], them
     if not clean_theme:
         raise ValueError("Tema não informado para sugerir formato de vídeo.")
 
-    system = """
-Você recomenda o melhor formato de vídeo para Instagram com base no tema, no objetivo do conteúdo e no contexto do negócio.
+    platform_label = "TikTok" if _trim_text(agent_key).lower() == "tiktok" else "Instagram"
+    if platform_label == "TikTok":
+        platform_notes = [
+            "- escolha o formato que faça a promessa bater mais cedo",
+            "- priorize gancho imediato, velocidade cognitiva e frase curta",
+            "- evite formatos que dependam de introdução longa ou contexto morno",
+        ]
+    else:
+        platform_notes = [
+            "- escolha o formato mais claro e mais forte para explicar o tema",
+            "- priorize retenção, clareza e naturalidade",
+            "- prefira formatos que funcionem bem como Reels de autoridade",
+        ]
+
+    system = f"""
+Você recomenda o melhor formato de vídeo para {platform_label} com base no tema, no objetivo do conteúdo e no contexto do negócio.
 Responda SOMENTE em JSON com as chaves: recommended_format_id, rationale.
 Escolha obrigatoriamente um dos formatos válidos abaixo:
 - direct_camera
@@ -2892,8 +2938,8 @@ Escolha obrigatoriamente um dos formatos válidos abaixo:
 - quick_diagnosis
 
 Critérios:
-- escolha o formato mais claro e mais forte para explicar o tema
-- priorize retenção, clareza e naturalidade
+- pense em retenção, clareza, naturalidade e aderência ao comportamento da plataforma
+{chr(10).join(platform_notes)}
 - não invente fatos
 - rationale curta, objetiva e prática
 """.strip()
@@ -3675,6 +3721,824 @@ Regras:
 
     return _build_instagram_captions_fallback(nucleus or {}, selected_theme)
 
+
+def _tiktok_content_type_label(value: str) -> str:
+    clean = _trim_text(value)
+    return TIKTOK_CONTENT_TYPE_LABELS.get(clean, clean or "não informado")
+
+
+def _tiktok_content_goal_label(value: str) -> str:
+    clean = _trim_text(value)
+    return TIKTOK_CONTENT_GOAL_LABELS.get(clean, clean or "não informado")
+
+
+def _is_tiktok_bio_task(requested_task: str) -> bool:
+    task = _trim_text(requested_task).lower()
+    if not task:
+        return False
+    if any(term in task for term in ["legenda", "roteiro", "trend", "hook"]):
+        return False
+    return any(term in task for term in ["bio", "perfil"])
+
+
+def _run_tiktok_script_task(agent_key: str, nucleus: Dict[str, Any], requested_task: str, selected_theme: str) -> Dict[str, Any]:
+    selected_format_id = _trim_text(nucleus.get("video_format")) or _trim_text(nucleus.get("selected_video_format"))
+    recommended_format_label = _trim_text(nucleus.get("recommended_video_format"))
+    if not recommended_format_label and _trim_text(nucleus.get("recommended_video_format_id")):
+        recommended_format_label = _video_format_label(_trim_text(nucleus.get("recommended_video_format_id")))
+    selected_format_label = _video_format_label(selected_format_id)
+
+    system = """
+Você cria roteiros de TikTok graváveis, rápidos, claros e estrategicamente fortes.
+Responda SOMENTE em JSON com as chaves:
+- titulo_da_tela
+- analise_do_tema
+- estrategia_do_video
+- hooks (array com 4 itens)
+- roteiro_segundo_a_segundo (array de objetos com tempo, acao, fala)
+- texto_na_tela (array)
+- variacoes (array com 3 itens)
+- legenda
+
+Regras:
+- pt-BR
+- o primeiro bloco do roteiro precisa comunicar relevância rápido
+- fala natural, humana e gravável
+- sem frases genéricas de guru
+- o formato do vídeo precisa influenciar a construção do roteiro
+- analise_do_tema e estrategia_do_video devem ser objetivas
+- legenda curta, útil, com contexto e CTA leve
+- pense como TikTok nativo, não como Reels reciclado
+""".strip()
+    user = {
+        "task": requested_task,
+        "theme": selected_theme,
+        "selected_video_format": selected_format_label,
+        "recommended_video_format": recommended_format_label or selected_format_label,
+        "recommended_video_format_reason": _trim_text(nucleus.get("recommended_video_format_reason")),
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "nucleus": nucleus or {},
+    }
+    data = _call_chat_json(system=system, user=user, temperature=0.45, max_tokens=2600)
+    normalized = _normalize_authority_output(data)
+    if isinstance(normalized, dict):
+        normalized["video_format_selected"] = selected_format_label
+        normalized["video_format_recommended"] = recommended_format_label or selected_format_label
+        normalized["video_format_rationale"] = _trim_text(nucleus.get("recommended_video_format_reason")) or "Formato sugerido para acelerar retenção, clareza e aderência ao TikTok."
+    return normalized
+
+
+def _build_tiktok_bio_fallback(nucleus: Dict[str, Any], requested_task: str, selected_theme: str) -> Dict[str, Any]:
+    company = _trim_text(nucleus.get("company_name")) or "sua marca"
+    tiktok_ref = _trim_text(nucleus.get("tiktok")) or company
+    audience = _trim_text(nucleus.get("main_audience")) or "o público certo"
+    service_area = _trim_text(nucleus.get("service_area") or nucleus.get("city_state"))
+    services = _split_nucleus_items(nucleus.get("services_products"), max_items=4)
+    differentials = _split_nucleus_items(nucleus.get("real_differentials"), max_items=4)
+    proofs = _split_nucleus_items(nucleus.get("testimonials") or nucleus.get("reviews"), max_items=4)
+
+    service_focus = services[0] if services else "serviço principal"
+    secondary_focus = services[1] if len(services) > 1 else service_focus
+    differential = differentials[0] if differentials else "clareza de posicionamento"
+    proof_signal = proofs[0] if proofs else "conteúdo fixado com prova e contexto"
+
+    cta_line = "↓ Veja os vídeos fixados"
+    if _trim_text(nucleus.get("site")):
+        cta_line = "↓ Veja o link do perfil"
+    elif _trim_text(nucleus.get("whatsapp")) or _trim_text(nucleus.get("phone")):
+        cta_line = "↓ Chame no link do perfil"
+
+    context_line = f"Atuação em {service_area}" if service_area and service_area.lower() != "brasil" else ""
+    bio_lines = [
+        _trim_text(f"{service_focus} para {audience}", max_chars=80),
+        _trim_text(differential[:1].upper() + differential[1:], max_chars=74) if differential else "",
+        _trim_text(context_line or proof_signal, max_chars=72),
+        _trim_text(cta_line, max_chars=55),
+    ]
+    bio_lines = [line for line in bio_lines if line]
+    bio_primary = _compact_inline_text(" • ".join(bio_lines), max_chars=280)
+    profile_name_suggestion = _trim_text(f"{company} | {service_focus}", max_chars=80)
+
+    variations = [
+        f"{service_focus[:1].upper() + service_focus[1:]} para {audience}. {differential[:1].upper() + differential[1:] if differential else 'Clareza e contexto rápido'}. {cta_line}",
+        f"Ajudamos {audience} com {service_focus}. {proof_signal[:1].upper() + proof_signal[1:] if proof_signal else 'Conteúdo claro e direto'}. {cta_line}",
+        f"{company}: {service_focus} para {audience}. Menos ruído, mais direção prática. {cta_line}",
+        f"{service_focus[:1].upper() + service_focus[1:]} com foco em {secondary_focus}. {context_line or 'Conteúdo pensado para descoberta e confiança'}. {cta_line}",
+    ]
+
+    keyword_items: List[str] = []
+    for item in [company, service_focus, secondary_focus, audience, service_area, differential, proof_signal]:
+        clean = _trim_text(item, max_chars=80)
+        if clean and clean.lower() not in {existing.lower() for existing in keyword_items}:
+            keyword_items.append(clean)
+
+    fixed_video_cards = [
+        {
+            "nome": "Vídeo fixado 1 — Comece aqui",
+            "descricao": f"Apresente quem a {company} ajuda, qual problema resolve e por que esse perfil vale atenção. Esse vídeo reduz atrito e melhora entendimento imediato do posicionamento.",
+            "palavras_chave": [company, service_focus, audience],
+        },
+        {
+            "nome": "Vídeo fixado 2 — Prova ou processo",
+            "descricao": f"Mostre método, bastidor, antes e depois plausível ou leitura prática que prove {differential or 'consistência'} sem autopromoção vazia.",
+            "palavras_chave": [differential or "processo", proof_signal, "credibilidade"],
+        },
+        {
+            "nome": "Vídeo fixado 3 — Próximo passo",
+            "descricao": "Explique como funciona, para quem faz sentido e qual ação a pessoa deve tomar depois de conhecer o perfil. O objetivo é transformar curiosidade em direção.",
+            "palavras_chave": ["como funciona", "próximo passo", "CTA"],
+        },
+    ]
+
+    faq_items = [
+        {
+            "pergunta": "A bio do TikTok precisa vender?",
+            "resposta": "Ela precisa orientar rápido. No TikTok, a bio funciona melhor quando esclarece serviço, recorte e próximo passo sem tentar dizer tudo.",
+        },
+        {
+            "pergunta": "Vale repetir a especialidade no nome do perfil?",
+            "resposta": "Sim, quando isso melhora encontrabilidade e entendimento imediato. O campo Nome deve ajudar a pessoa a saber o que a marca entrega.",
+        },
+        {
+            "pergunta": "Vídeos fixados contam junto com a bio?",
+            "resposta": "Muito. No TikTok, perfil forte é pacote: nome, bio, link, vídeos fixados e coerência entre promessa e conteúdo.",
+        },
+    ]
+
+    return {
+        "titulo_da_tela": f"Bio estratégica para {tiktok_ref}",
+        "blocos": [
+            {
+                "tipo": "markdown",
+                "conteudo": {
+                    "texto": (
+                        f"### Leitura estratégica\n"
+                        f"O perfil da **{company}** precisa responder rápido **quem ajuda**, **o que entrega**, **qual recorte assume** e **qual ação a pessoa deve tomar**. "
+                        f"No TikTok, a bio funciona melhor quando é curta, explícita e apoiada por vídeos fixados que aprofundam contexto, prova e direção."
+                    )
+                },
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Nome do perfil sugerido",
+                    "texto": profile_name_suggestion,
+                    "icone": "star",
+                },
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Bio principal recomendada",
+                    "texto": bio_primary,
+                    "icone": "check",
+                },
+            },
+            {
+                "tipo": "markdown",
+                "conteudo": {
+                    "texto": "### Versão pronta em linhas\n" + "\n".join(
+                        f"- **Linha {idx + 1}:** {line}" for idx, line in enumerate(bio_lines[:4])
+                    )
+                },
+            },
+            {
+                "tipo": "response_variations",
+                "conteudo": {
+                    "titulo": "Variações prontas",
+                    "items": variations,
+                },
+            },
+            {
+                "tipo": "service_cards",
+                "conteudo": {
+                    "titulo": "Pacote ideal do perfil no TikTok",
+                    "items": fixed_video_cards,
+                },
+            },
+            {
+                "tipo": "timeline",
+                "conteudo": {
+                    "passos": [
+                        "1. AEO: a primeira leitura deve responder rápido quem é a marca, o que faz e para quem.",
+                        "2. AIO: use termos explícitos de serviço, público e contexto para IA e busca entenderem o perfil sem ambiguidade.",
+                        "3. GEO: só inclua cidade, região ou modalidade de atendimento quando isso aumentar relevância real.",
+                        "4. UX: deixe a bio curta e use os vídeos fixados para aprofundar prova, processo e próximo passo.",
+                    ],
+                },
+            },
+            {
+                "tipo": "keyword_list",
+                "conteudo": {
+                    "titulo": "Termos semânticos de apoio",
+                    "limite_por_item": "curtos, claros e reaproveitáveis",
+                    "items": keyword_items[:8],
+                },
+            },
+            {
+                "tipo": "faq",
+                "conteudo": {
+                    "perguntas": faq_items,
+                },
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Recomendação final",
+                    "texto": "No TikTok, a bio sozinha não resolve. Use o campo Nome para especialidade, a bio para clareza e os 3 vídeos fixados para fechar entendimento, prova e direção.",
+                    "icone": "lightbulb",
+                },
+            },
+        ],
+    }
+
+
+def _run_tiktok_bio_task(nucleus: Dict[str, Any], requested_task: str, selected_theme: str) -> Dict[str, Any]:
+    system = """
+Você cria bios estratégicas de TikTok com clareza de posicionamento, leitura rápida e semântica forte.
+Responda SOMENTE em JSON com as chaves:
+- titulo_da_tela
+- analise_estrategica
+- nome_do_perfil_sugerido
+- bio_principal
+- bio_em_linhas (array com 3 a 4 itens)
+- variacoes_de_bio (array com 4 itens)
+- fundamentos_aeo_aio_geo (array com 4 a 6 itens)
+- palavras_chave_estrategicas (array com 6 a 10 itens)
+- videos_fixados_recomendados (array com 3 objetos {nome, descricao, palavras_chave})
+- faq (array com 2 a 4 objetos {pergunta, resposta})
+- recomendacao_final
+
+Regras obrigatórias:
+- pt-BR.
+- A bio precisa deixar claro: quem é a marca, o que faz, para quem e qual o próximo passo.
+- Aplique AEO, AIO e GEO de forma prática.
+- Não invente números, clientes, cidades, provas, diferenciais ou promessas.
+- Sem slogan vazio, sem hashtags, sem emoji desnecessário e sem marketing inflado.
+- bio_principal deve sair pronta para uso.
+- nome_do_perfil_sugerido deve melhorar entendimento e encontrabilidade.
+- videos_fixados_recomendados devem complementar a bio com função clara.
+""".strip()
+
+    user = {
+        "task": requested_task or "Bio estratégica (AEO, AIO E GEO)",
+        "selected_theme": selected_theme or "não informado",
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "nucleus": nucleus or {},
+    }
+
+    try:
+        data = _call_chat_json(system=system, user=user, temperature=0.35, max_tokens=2600)
+        normalized = _normalize_authority_output(data)
+        blocks = list(normalized.get("blocos") or [])
+
+        fixed_videos = data.get("videos_fixados_recomendados")
+        if isinstance(fixed_videos, list):
+            cards = []
+            for item in fixed_videos[:3]:
+                if not isinstance(item, dict):
+                    continue
+                cards.append({
+                    "nome": _trim_text(item.get("nome") or "Vídeo fixado"),
+                    "descricao": _trim_text(item.get("descricao") or item.get("texto")),
+                    "palavras_chave": _coerce_string_list(item.get("palavras_chave"), max_items=4, max_chars=50),
+                })
+            if cards:
+                insert_at = min(5, len(blocks))
+                blocks.insert(insert_at, {
+                    "tipo": "service_cards",
+                    "conteudo": {"titulo": "Vídeos fixados recomendados", "items": cards},
+                })
+                normalized["blocos"] = blocks
+
+        if _is_valid_instagram_bio_output(normalized):
+            return normalized
+    except Exception:
+        pass
+
+    return _build_tiktok_bio_fallback(nucleus or {}, requested_task, selected_theme)
+
+
+def _build_tiktok_captions_fallback(nucleus: Dict[str, Any], selected_theme: str) -> Dict[str, Any]:
+    company = _trim_text(nucleus.get("company_name")) or "a marca"
+    audience = _trim_text(nucleus.get("main_audience")) or "o público certo"
+    theme = _trim_text(selected_theme) or "o tema principal"
+    content_type = _tiktok_content_type_label(_trim_text(nucleus.get("content_type")))
+    goal = _tiktok_content_goal_label(_trim_text(nucleus.get("content_goal")))
+    service_area = _trim_text(nucleus.get("service_area") or nucleus.get("city_state"))
+    services = _split_nucleus_items(nucleus.get("services_products"), max_items=4)
+    differentials = _split_nucleus_items(nucleus.get("real_differentials"), max_items=3)
+
+    service_focus = services[0] if services else "solução principal"
+    differential = differentials[0] if differentials else "clareza prática"
+    local_context = f" em {service_area}" if service_area else ""
+
+    if "descoberta" in goal.lower():
+        cta_focus = "Salva esse vídeo se esse ponto te ajudou a enxergar o tema com mais clareza."
+        closing_variations = [
+            "Esse é o tipo de detalhe que faz alguém parar de passar e começar a prestar atenção.",
+            "Quando o recorte fica claro, o vídeo para de parecer mais um e passa a ser lembrado.",
+            "Descoberta boa começa com contexto que o público entende em segundos.",
+            "Nem tudo precisa ser trend. Mas tudo precisa fazer sentido para quem está vendo.",
+            "Se esse ângulo te abriu uma ideia, guarda para gravar depois.",
+        ]
+    elif "autoridade" in goal.lower():
+        cta_focus = "Se esse raciocínio te ajudou, acompanha o perfil para aprofundar os próximos temas."
+        closing_variations = [
+            "Autoridade no TikTok não vem de falar rápido. Vem de fazer a mensagem bater cedo e com precisão.",
+            "Quem domina o recorte certo parece mais confiável sem precisar forçar pose.",
+            "O que prende não é exagero. É relevância bem entregue.",
+            "Quando a mensagem encaixa, o público entende mais rápido por que isso importa.",
+            "Esse é o tipo de ajuste que faz o perfil parecer mais sério e mais lembrado.",
+        ]
+    elif "convers" in goal.lower():
+        cta_focus = "Se você quer aplicar isso no seu caso, o próximo passo está no link do perfil."
+        closing_variations = [
+            "Conteúdo bom prepara decisão quando o próximo passo fica simples.",
+            "Quando a pessoa entende o recorte, a conversão deixa de depender de insistência.",
+            "Vídeo curto não vende sozinho. Mas ele abre a conversa certa.",
+            "Clareza no TikTok reduz atrito antes do direct ou do clique.",
+            "Se esse é o gargalo hoje, vale transformar isso em padrão.",
+        ]
+    else:
+        cta_focus = "Comenta sua visão sobre isso porque esse tema merece troca real."
+        closing_variations = [
+            "Interação boa nasce de opinião com contexto, não de pergunta jogada.",
+            "Esse tema parece simples até a prática mostrar o contrário.",
+            "Quero saber qual parte você concorda e qual parte você contestaria.",
+            "O melhor debate começa quando o recorte está claro.",
+            "Tem um contraponto aqui que vale conversa.",
+        ]
+
+    captions = [
+        f"{theme} só prende no TikTok quando fica claro, cedo e sem enrolação. Para {audience}, o vídeo precisa conectar **{theme}** com um impacto real de **{service_focus}{local_context}**.",
+        f"Se o seu vídeo sobre {theme} informa, mas não faz ninguém parar, o problema não é só edição. Falta contexto, recorte e um jeito simples de mostrar por que isso importa agora.",
+        f"O erro mais comum em conteúdos sobre {theme} é explicar demais antes de provar relevância. Quando a {company} trabalha esse assunto, o foco é bater na dor cedo e conduzir o raciocínio sem excesso.",
+        f"Nem todo vídeo sobre {theme} precisa seguir trend. Mas ele precisa fazer sentido para quem vê. Quando tema, recorte e consequência aparecem rápido, o conteúdo ganha mais força.",
+        f"{theme} não deveria soar como frase pronta. O TikTok recompensa leitura rápida, contexto claro e promessa sustentada. É isso que faz o vídeo parecer útil e não só mais um.",
+    ]
+
+    return {
+        "titulo_da_tela": f"Legendas estratégicas para {theme}",
+        "blocos": [
+            {
+                "tipo": "markdown",
+                "conteudo": {
+                    "texto": (
+                        f"### Leitura estratégica\n"
+                        f"Este conteúdo é do tipo **{content_type}** e precisa trabalhar **{goal.lower()}** sem repetir o roteiro. "
+                        f"A legenda no TikTok deve complementar o vídeo, ajudar descoberta e deixar o tema mais explícito para {audience}."
+                    )
+                },
+            },
+            {
+                "tipo": "markdown",
+                "conteudo": {
+                    "texto": (
+                        f"### Estrutura ideal\n"
+                        f"1. Abra com uma frase curta que reforce o recorte de **{theme}**.\n"
+                        f"2. Contextualize em 1 ou 2 linhas por que isso importa para **{audience}**.\n"
+                        f"3. Feche com um CTA leve coerente com **{goal.lower()}**."
+                    )
+                },
+            },
+            {
+                "tipo": "response_variations",
+                "conteudo": {"titulo": "5 legendas prontas", "items": captions},
+            },
+            {
+                "tipo": "response_variations",
+                "conteudo": {"titulo": "Frases finais de apoio", "items": [cta_focus, *closing_variations]},
+            },
+            {
+                "tipo": "keyword_list",
+                "conteudo": {
+                    "titulo": "Termos semânticos de apoio",
+                    "limite_por_item": "curtos, claros e reaproveitáveis",
+                    "items": [item for item in [theme, audience, service_focus, differential, content_type, goal, service_area] if item][:10],
+                },
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Recomendação final",
+                    "texto": "No TikTok, legenda boa reforça recorte, descoberta e intenção. Ela não deve recontar o vídeo inteiro nem virar texto solto sem função.",
+                    "icone": "check",
+                },
+            },
+        ],
+    }
+
+
+def _is_valid_tiktok_captions_output(data: Dict[str, Any]) -> bool:
+    return _is_valid_instagram_captions_output(data)
+
+
+def _run_tiktok_captions_task(nucleus: Dict[str, Any], selected_theme: str) -> Dict[str, Any]:
+    system = """
+Sua missão é criar legendas estratégicas para TikTok.
+Responda SOMENTE em JSON com:
+- titulo_da_tela
+- blocos (array)
+
+Use somente tipos de bloco: markdown, highlight, response_variations, keyword_list.
+
+Estruture em:
+1. análise estratégica
+2. estrutura ideal da legenda
+3. 5 legendas prontas
+4. frases finais de apoio
+5. termos semânticos de apoio
+6. recomendação final
+
+Regras:
+- as 5 legendas prontas devem vir em um bloco response_variations
+- as frases finais devem vir em um bloco response_variations separado
+- termos semânticos em um bloco keyword_list
+- linguagem humana, natural e sem cara de texto de IA
+- legenda curta, utilitária e coerente com TikTok
+- não repetir o roteiro inteiro
+""".strip()
+    user = {
+        "theme": selected_theme,
+        "content_type": _tiktok_content_type_label(_trim_text(nucleus.get("content_type"))),
+        "content_goal": _tiktok_content_goal_label(_trim_text(nucleus.get("content_goal"))),
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "nucleus": nucleus or {},
+    }
+
+    try:
+        normalized = _normalize_authority_output(_call_chat_json(system=system, user=user, temperature=0.4, max_tokens=2600))
+        if _is_valid_tiktok_captions_output(normalized):
+            return normalized
+    except Exception:
+        pass
+
+    return _build_tiktok_captions_fallback(nucleus or {}, selected_theme)
+
+
+def _build_tiktok_hooks_fallback(nucleus: Dict[str, Any], selected_theme: str) -> Dict[str, Any]:
+    company = _trim_text(nucleus.get("company_name")) or "a marca"
+    audience = _trim_text(nucleus.get("main_audience")) or "o público certo"
+    theme = _trim_text(selected_theme) or "o tema principal"
+    service_focus = (_split_nucleus_items(nucleus.get("services_products"), max_items=2) or ["serviço principal"])[0]
+    differential = (_split_nucleus_items(nucleus.get("real_differentials"), max_items=2) or ["clareza prática"])[0]
+
+    hooks = [
+        f"Se você fala de {theme} desse jeito, seu vídeo morre antes de começar.",
+        f"O erro que faz vídeos sobre {theme} parecerem mais do mesmo.",
+        f"Quase ninguém explica {theme} de um jeito que realmente prende atenção.",
+        f"Em 15 segundos, dá para entender por que {theme} trava tanto resultado.",
+        f"Se {audience} não entende isso cedo, o vídeo já perdeu força.",
+        f"O problema não é o tema {theme}. É o jeito como ele entra no vídeo.",
+        f"Quer fazer {theme} parecer importante sem exagerar? Começa assim.",
+        f"Esse detalhe muda a forma como {audience} percebe {service_focus}.",
+        f"Você não precisa falar mais rápido para prender. Precisa abrir melhor.",
+        f"Se a promessa do vídeo não bate cedo, o público vai embora mesmo.",
+        f"O erro mais comum em vídeos sobre {theme}? Contexto demais, impacto de menos.",
+        f"Como abrir um vídeo sobre {theme} sem soar genérico nem forçado.",
+    ]
+
+    families = [
+        {
+            "nome": "Hook de erro",
+            "descricao": f"Abre mostrando o erro mais comum que faz conteúdos sobre {theme} perderem força logo no começo.",
+            "palavras_chave": ["erro", "quebra de padrão", "diagnóstico"],
+        },
+        {
+            "nome": "Hook de contraste",
+            "descricao": f"Compara o jeito genérico de falar de {theme} com um recorte mais forte e útil para {audience}.",
+            "palavras_chave": ["contraste", "antes e depois", "clareza"],
+        },
+        {
+            "nome": "Hook de promessa curta",
+            "descricao": f"Promete uma leitura rápida, específica e plausível sobre {theme}, sem clickbait vazio.",
+            "palavras_chave": ["promessa", "especificidade", "relevância"],
+        },
+        {
+            "nome": "Hook de consequência",
+            "descricao": f"Mostra o impacto prático de ignorar esse ponto em {service_focus} ou no posicionamento da marca.",
+            "palavras_chave": ["consequência", "impacto", differential],
+        },
+    ]
+
+    return {
+        "titulo_da_tela": f"Hooks de abertura para {theme}",
+        "blocos": [
+            {
+                "tipo": "markdown",
+                "conteudo": {
+                    "texto": (
+                        f"### Leitura estratégica\n"
+                        f"Hook bom no TikTok não é só frase forte. Ele precisa fazer **{audience}** sentir rapidamente por que **{theme}** importa, "
+                        f"sem introdução morna nem exagero vazio."
+                    )
+                },
+            },
+            {
+                "tipo": "response_variations",
+                "conteudo": {"titulo": "12 hooks prontos", "items": hooks},
+            },
+            {
+                "tipo": "service_cards",
+                "conteudo": {"titulo": "Famílias de hook para variar sem repetir", "items": families},
+            },
+            {
+                "tipo": "timeline",
+                "conteudo": {
+                    "passos": [
+                        "1. Escolha o hook que bate mais cedo na dor, curiosidade ou consequência real.",
+                        "2. Use a próxima frase para provar por que o assunto importa agora.",
+                        "3. Só depois aprofunde. No TikTok, o gancho abre a porta; não carregue tudo nele.",
+                        "4. Grave 2 ou 3 aberturas e compare qual soa mais natural e mais cortante.",
+                    ]
+                },
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Recomendação final",
+                    "texto": f"Para a {company}, o melhor hook será o que abre com recorte claro de {theme} e já prepara o vídeo para falar de {service_focus} com direção.",
+                    "icone": "lightbulb",
+                },
+            },
+        ],
+    }
+
+
+def _is_valid_tiktok_hooks_output(data: Dict[str, Any]) -> bool:
+    if not isinstance(data, dict):
+        return False
+    blocks = data.get("blocos")
+    if not isinstance(blocks, list) or len(blocks) < 3:
+        return False
+    has_variations = False
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if _trim_text(block.get("tipo")).lower() == "response_variations":
+            items = ((block.get("conteudo") or {}).get("items") if isinstance(block.get("conteudo"), dict) else None)
+            if isinstance(items, list) and len(items) >= 8:
+                has_variations = True
+    return has_variations
+
+
+def _run_tiktok_hooks_task(nucleus: Dict[str, Any], requested_task: str, selected_theme: str) -> Dict[str, Any]:
+    system = """
+Sua missão é criar hooks de abertura fortes para TikTok.
+Responda SOMENTE em JSON com:
+- titulo_da_tela
+- blocos (array)
+
+Use tipos de bloco: markdown, response_variations, service_cards, timeline, highlight.
+
+Estruture em:
+1. leitura estratégica
+2. 10 a 12 hooks prontos
+3. famílias de hook para variar o início
+4. como escolher o hook certo
+5. recomendação final
+
+Regras:
+- hooks curtos, fortes e graváveis
+- sem clickbait mentiroso
+- sem frases genéricas de guru
+- os hooks devem variar de ângulo e não ser só paráfrase
+""".strip()
+    user = {
+        "task": requested_task or "Hooks de abertura",
+        "theme": selected_theme,
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "nucleus": nucleus or {},
+    }
+
+    try:
+        normalized = _normalize_authority_output(_call_chat_json(system=system, user=user, temperature=0.45, max_tokens=2600))
+        if _is_valid_tiktok_hooks_output(normalized):
+            return normalized
+    except Exception:
+        pass
+
+    return _build_tiktok_hooks_fallback(nucleus or {}, selected_theme)
+
+
+def _build_tiktok_trends_queries(nucleus: Dict[str, Any]) -> List[str]:
+    niche = _trim_text(nucleus.get("niche")) or _trim_text(nucleus.get("segment")) or _trim_text(nucleus.get("main_audience"))
+    services = _split_nucleus_items(nucleus.get("services_products"), max_items=3)
+    service_focus = services[0] if services else _trim_text(nucleus.get("offer")) or niche or "negócios"
+    region = _trim_text(nucleus.get("service_area") or nucleus.get("city_state"))
+    parts = [part for part in [niche, service_focus, region] if part]
+    seed = " ".join(parts).strip() or "negócios"
+
+    return [
+        f'site:ads.tiktok.com/business/creativecenter "{seed}" TikTok trends',
+        f'site:tiktok.com "{seed}" TikTok trend',
+        f'{seed} tendências TikTok',
+        f'{service_focus} viral TikTok ideias',
+    ]
+
+
+def _tiktok_trends_official_results(nucleus: Dict[str, Any]) -> List[JsonDict]:
+    if not ENABLE_WEB_SEARCH:
+        return []
+
+    collected: List[JsonDict] = []
+    seen_urls: set[str] = set()
+    queries = _build_tiktok_trends_queries(nucleus)
+
+    for query in queries:
+        results = _filter_domains(_serper_search(query, max_results=6), ["ads.tiktok.com", "tiktok.com"])
+        for result in results:
+            url = _trim_text(result.get("url"))
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            collected.append(result)
+            if len(collected) >= 8:
+                return collected
+
+    if collected:
+        return collected
+
+    # fallback: se não houver fonte oficial suficiente, ainda assim usa sinais gerais da web
+    for query in queries:
+        results = _serper_search(query, max_results=6)
+        for result in results:
+            url = _trim_text(result.get("url"))
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            collected.append(result)
+            if len(collected) >= 8:
+                return collected
+
+    return collected
+
+
+def _build_tiktok_trends_fallback(nucleus: Dict[str, Any], web_results: Optional[List[JsonDict]] = None) -> Dict[str, Any]:
+    company = _trim_text(nucleus.get("company_name")) or "a marca"
+    audience = _trim_text(nucleus.get("main_audience")) or "o público certo"
+    niche = _trim_text(nucleus.get("niche")) or _trim_text(nucleus.get("segment")) or _trim_text(nucleus.get("services_products")) or "o nicho da marca"
+    service_focus = (_split_nucleus_items(nucleus.get("services_products"), max_items=3) or ["serviço principal"])[0]
+    differential = (_split_nucleus_items(nucleus.get("real_differentials"), max_items=3) or ["abordagem própria"])[0]
+
+    proprietary_ideas = [
+        f"Erro comum que faz {audience} ignorar {service_focus} mesmo quando precisam disso.",
+        f"Antes e depois de comunicar {service_focus} do jeito genérico versus do jeito que gera entendimento.",
+        f"3 sinais de que alguém está tentando resolver {service_focus} da forma errada.",
+        f"O que quase ninguém do nicho de {niche} fala sobre {service_focus}, mas deveria falar.",
+        f"Como transformar {differential} em um vídeo curto que parece útil já nos primeiros segundos.",
+    ]
+
+    if not web_results:
+        return {
+            "titulo_da_tela": f"Caçador de trends para {company}",
+            "blocos": [
+                {
+                    "tipo": "highlight",
+                    "conteudo": {
+                        "titulo": "Leitura atual",
+                        "texto": "Não encontrei sinais suficientes de trends com aderência confiável ao nicho neste momento. Em vez de forçar trend errada, o melhor caminho é usar ideias proprietárias com linguagem nativa de TikTok.",
+                        "icone": "lightbulb",
+                    },
+                },
+                {
+                    "tipo": "response_variations",
+                    "conteudo": {"titulo": "5 ideias proprietárias para gravar agora", "items": proprietary_ideas},
+                },
+                {
+                    "tipo": "timeline",
+                    "conteudo": {
+                        "passos": [
+                            "1. Escolha a ideia com dor mais óbvia para o público.",
+                            "2. Abra com um hook de erro, contraste ou consequência.",
+                            "3. Grave curto, direto e com uma promessa que o vídeo realmente cumpra.",
+                            "4. Observe comentários e retenção para transformar a melhor ideia em série.",
+                        ]
+                    },
+                },
+                {
+                    "tipo": "highlight",
+                    "conteudo": {
+                        "titulo": "Regra de ouro",
+                        "texto": "Trend sem aderência destrói posicionamento. No TikTok, é melhor uma ideia própria forte do que uma tendência aleatória só porque está em alta.",
+                        "icone": "check",
+                    },
+                },
+            ],
+        }
+
+    source_lines = []
+    for idx, item in enumerate(web_results[:6], 1):
+        title = _trim_text(item.get("title"), max_chars=120)
+        snippet = _trim_text(item.get("snippet"), max_chars=180)
+        host = _host_from_url(_trim_text(item.get("url")))
+        line = f"- **[{idx}] {title}**"
+        if host:
+            line += f" ({host})"
+        if snippet:
+            line += f": {snippet}"
+        source_lines.append(line)
+
+    cards = []
+    for idx, item in enumerate(web_results[:4], 1):
+        title = _trim_text(item.get("title"), max_chars=90) or f"Sinal de trend {idx}"
+        snippet = _trim_text(item.get("snippet"), max_chars=220) or "Sinal observado na web para adaptação estratégica."
+        cards.append({
+            "nome": f"Sinal {idx} — {title}",
+            "descricao": (
+                f"{snippet} Adaptação para a {company}: transforme esse sinal em vídeo sobre {service_focus}, "
+                f"mantendo aderência ao público {audience} e evitando trend forçada."
+            ),
+            "palavras_chave": [niche, service_focus, "gancho", "adaptação"],
+        })
+
+    return {
+        "titulo_da_tela": f"Caçador de trends para {company}",
+        "blocos": [
+            {
+                "tipo": "markdown",
+                "conteudo": {
+                    "texto": (
+                        f"### Leitura estratégica\n"
+                        f"Encontrei sinais de conteúdo em torno de **{niche}** e usei isso como radar, não como ordem cega. "
+                        f"O objetivo aqui é adaptar o que está chamando atenção para o universo de **{service_focus}**, preservando contexto, autoridade e aderência ao público."
+                    )
+                },
+            },
+            {
+                "tipo": "service_cards",
+                "conteudo": {"titulo": "Sinais de trend com potencial de adaptação", "items": cards},
+            },
+            {
+                "tipo": "response_variations",
+                "conteudo": {"titulo": "5 ideias proprietárias para não depender só de trend", "items": proprietary_ideas},
+            },
+            {
+                "tipo": "markdown",
+                "conteudo": {"texto": "### Fontes observadas\n" + "\n".join(source_lines)},
+            },
+            {
+                "tipo": "highlight",
+                "conteudo": {
+                    "titulo": "Recomendação final",
+                    "texto": "Use trend como acelerador de descoberta, não como substituto de posicionamento. Se o sinal não encaixar no nicho, descarte e grave ideia própria.",
+                    "icone": "check",
+                },
+            },
+        ],
+    }
+
+
+def _run_tiktok_trends_task(nucleus: Dict[str, Any]) -> Dict[str, Any]:
+    web_results = _tiktok_trends_official_results(nucleus or {})
+    if not web_results:
+        return _build_tiktok_trends_fallback(nucleus or {}, [])
+
+    system = """
+Sua missão é agir como um caçador de trends para TikTok com foco em aderência ao nicho.
+Você receberá:
+- núcleo do negócio
+- sinais de busca web relacionados a TikTok
+
+Responda SOMENTE em JSON com:
+- titulo_da_tela
+- blocos (array)
+
+Use tipos de bloco: markdown, service_cards, response_variations, highlight.
+
+Estruture em:
+1. leitura estratégica
+2. sinais de trend com potencial de adaptação (service_cards)
+3. 5 ideias proprietárias para não depender só de trend
+4. fontes observadas
+5. recomendação final
+
+Regras:
+- não invente trend quando os sinais estiverem fracos
+- se a aderência for baixa, diga isso claramente
+- adapte o sinal ao nicho da empresa
+- não force trend só porque está viral
+""".strip()
+
+    user = {
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "nucleus": nucleus or {},
+        "web_results": web_results,
+        "web_context": _format_web_context(web_results),
+    }
+
+    try:
+        normalized = _normalize_authority_output(_call_chat_json(system=system, user=user, temperature=0.35, max_tokens=2600))
+        blocks = normalized.get("blocos") if isinstance(normalized, dict) else None
+        if isinstance(blocks, list) and len(blocks) >= 3:
+            return normalized
+    except Exception:
+        pass
+
+    return _build_tiktok_trends_fallback(nucleus or {}, web_results)
+
+
 def suggest_themes_for_task(agent_key: str, nucleus: Dict[str, Any], task: str) -> List[str]:
     _require_key()
 
@@ -3735,6 +4599,20 @@ def suggest_themes_for_task(agent_key: str, nucleus: Dict[str, Any], task: str) 
 
 
 
+SKYBOB_MODEL = "gpt-5.4"
+
+
+def _skybob_timestamp() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _skybob_make_scoped_id(prefix: str, run_id: str, raw_value: Any, index: int) -> str:
+    seed = re.sub(r"[^a-z0-9]+", "-", str(raw_value or "").lower()).strip("-")
+    if not seed:
+        seed = str(index + 1)
+    return f"{prefix}-{run_id}-{seed[:40]}"
+
+
 def _skybob_extract_catalog_items(nucleus: Dict[str, Any], *, max_items: int = 10) -> List[str]:
     flat = {k: v for k, v in _flatten_nucleus(nucleus or {})}
 
@@ -3783,16 +4661,395 @@ def _skybob_pick_primary_context(nucleus: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
-def _skybob_prompt_payload(nucleus: Dict[str, Any], preferences: Optional[Dict[str, Any]] = None, previous_study: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _skybob_catalog_analysis_to_text(analysis: Dict[str, Any]) -> str:
+    lines: List[str] = [
+        "SkyBob · Pré-análise de catálogo",
+        "",
+        _trim_text(analysis.get("summary")) or "Sem resumo disponível.",
+        "",
+    ]
+
+    for item in analysis.get("detected_items") or []:
+        if not isinstance(item, dict):
+            continue
+        name = _trim_text(item.get("name"))
+        if not name:
+            continue
+        kind = _trim_text(item.get("kind")) or "item"
+        lines.append(f"- {name} ({kind})")
+        rationale = _trim_text(item.get("rationale"))
+        if rationale:
+            lines.append(f"  Leitura: {rationale}")
+        study = _trim_text(item.get("study"))
+        if study:
+            lines.append(f"  Estudo inicial: {study}")
+        pains = [_trim_text(x) for x in (item.get("pains") or []) if _trim_text(x)]
+        if pains:
+            lines.append("  Dores:")
+            for pain in pains[:3]:
+                lines.append(f"    • {pain}")
+        desires = [_trim_text(x) for x in (item.get("desires") or []) if _trim_text(x)]
+        if desires:
+            lines.append("  Desejos:")
+            for desire in desires[:3]:
+                lines.append(f"    • {desire}")
+        objections = [_trim_text(x) for x in (item.get("objections") or []) if _trim_text(x)]
+        if objections:
+            lines.append("  Objeções:")
+            for objection in objections[:3]:
+                lines.append(f"    • {objection}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _skybob_build_catalog_fallback_analysis(nucleus: Dict[str, Any]) -> Dict[str, Any]:
+    context = _skybob_pick_primary_context(nucleus or {})
+    detected_items = _skybob_extract_catalog_items(nucleus or {}, max_items=8)
+    if not detected_items:
+        fallback_item = context.get("oferta")
+        if fallback_item and fallback_item != "não informado":
+            detected_items = [fallback_item]
+        elif context.get("especialidade") and context.get("especialidade") != "não informado":
+            detected_items = [context["especialidade"]]
+        else:
+            detected_items = ["Oferta principal"]
+
+    normalized_items: List[Dict[str, Any]] = []
+    publico = context.get("publico") if context.get("publico") != "não informado" else "o cliente ideal"
+    diferenciais = context.get("diferenciais") if context.get("diferenciais") != "não informado" else "um posicionamento mais útil e específico"
+
+    for index, item in enumerate(detected_items):
+        clean_item = _trim_text(item, max_chars=180) or f"Item {index + 1}"
+        normalized_items.append(
+            {
+                "id": f"catalog-{index+1}",
+                "name": clean_item,
+                "kind": "oferta",
+                "rationale": _trim_text(
+                    f"{clean_item} aparece no núcleo como parte relevante da oferta e precisa virar eixo editorial próprio.",
+                    max_chars=260,
+                ),
+                "study": _trim_text(
+                    f"Para {publico}, {clean_item} tende a performar melhor quando o conteúdo prova aplicação prática, mostra erro recorrente e diferencia a execução.",
+                    max_chars=360,
+                ),
+                "pains": [
+                    _trim_text(f"Dúvida sobre quando {clean_item} realmente faz sentido.", max_chars=180),
+                    _trim_text(f"Medo de investir em {clean_item} e não perceber valor rápido.", max_chars=180),
+                ],
+                "desires": [
+                    _trim_text(f"Entender como {clean_item} ajuda na decisão ou no resultado final.", max_chars=180),
+                    _trim_text(f"Escolher {clean_item} com mais segurança e menos tentativa e erro.", max_chars=180),
+                ],
+                "objections": [
+                    _trim_text(f"Percepção de que {clean_item} pode ser genérico ou parecido com o mercado.", max_chars=180),
+                    _trim_text(f"Dificuldade de comparar {clean_item} com alternativas ou inércia atual.", max_chars=180),
+                ],
+                "messaging_angles": [
+                    _trim_text(f"Erro comum ligado a {clean_item}.", max_chars=140),
+                    _trim_text(f"Diagnóstico prático antes de contratar {clean_item}.", max_chars=140),
+                    _trim_text(f"Diferencial real de {clean_item}: {diferenciais}.", max_chars=180),
+                ],
+                "evidence": [
+                    _trim_text(f"Baseado no núcleo atual da empresa e na oferta declarada: {context.get('oferta')}.", max_chars=220)
+                ],
+            }
+        )
+
+    summary = _trim_text(
+        f"O catálogo foi normalizado antes da execução do SkyBob para reduzir generalismo. Os principais itens detectados foram: {', '.join(item['name'] for item in normalized_items[:5])}.",
+        max_chars=500,
+    )
+
+    result = {
+        "analysis_id": uuid4().hex[:12],
+        "generated_at": _skybob_timestamp(),
+        "model_used": "fallback-local",
+        "summary": summary,
+        "detected_items": normalized_items,
+    }
+    result["serialized_text"] = _skybob_catalog_analysis_to_text(result)
+    return result
+
+
+
+def _skybob_call_json(
+    *,
+    system: str,
+    payload: Dict[str, Any],
+    temperature: float = 0.45,
+    max_tokens: int = 3200,
+) -> tuple[Dict[str, Any], str]:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY não configurada para o SkyBob.")
+
+    client = OpenAI(
+        api_key=OPENAI_API_KEY,
+        timeout=180.0,
+        max_retries=1,
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": _json_dumps(payload)},
+    ]
+
+    retry_budgets: List[int] = []
+    for candidate in [
+        max_tokens,
+        max(max_tokens * 2, 8000),
+        max(max_tokens * 3, 16000),
+    ]:
+        if candidate not in retry_budgets:
+            retry_budgets.append(candidate)
+
+    last_error: Optional[Exception] = None
+
+    def _extract_raw_text(resp: Any) -> tuple[str, Any, Any, Any, Any]:
+        choice = resp.choices[0]
+        message = choice.message
+
+        content = getattr(message, "content", None)
+        refusal = getattr(message, "refusal", None)
+        tool_calls = getattr(message, "tool_calls", None)
+        finish_reason = getattr(choice, "finish_reason", None)
+        usage = getattr(resp, "usage", None)
+
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        text_parts.append(str(part.get("text", "")))
+                    continue
+
+                part_type = getattr(part, "type", None)
+                if part_type == "text":
+                    text_value = getattr(part, "text", "")
+                    if isinstance(text_value, dict):
+                        text_parts.append(str(text_value.get("value", "")))
+                    else:
+                        text_parts.append(str(getattr(text_value, "value", text_value) or ""))
+
+            raw_text = "".join(text_parts).strip()
+        else:
+            raw_text = (content or "").strip()
+
+        return raw_text, finish_reason, refusal, tool_calls, usage
+
+    for attempt_index, budget in enumerate(retry_budgets, start=1):
+        common_kwargs = {
+            "model": SKYBOB_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_completion_tokens": budget,
+        }
+
+        try:
+            resp = client.chat.completions.create(
+                **common_kwargs,
+                response_format={"type": "json_object"},
+            )
+        except Exception as first_error:
+            logger.warning(
+                "SkyBob primary chat completion failed; retrying without response_format. attempt=%s budget=%s model=%s error=%s: %s",
+                attempt_index,
+                budget,
+                SKYBOB_MODEL,
+                type(first_error).__name__,
+                str(first_error),
+            )
+            try:
+                resp = client.chat.completions.create(**common_kwargs)
+            except Exception as second_error:
+                logger.exception(
+                    "SkyBob chat completion failed after retry. attempt=%s budget=%s model=%s error=%s: %s payload_mode=%s payload_keys=%s",
+                    attempt_index,
+                    budget,
+                    SKYBOB_MODEL,
+                    type(second_error).__name__,
+                    str(second_error),
+                    payload.get("mode"),
+                    sorted(payload.keys()),
+                )
+                last_error = RuntimeError(
+                    f"Falha ao chamar o modelo {SKYBOB_MODEL}. "
+                    f"Tentativa {attempt_index} com budget {budget}. "
+                    f"response_format: {type(first_error).__name__}: {first_error}. "
+                    f"sem response_format: {type(second_error).__name__}: {second_error}."
+                )
+                continue
+
+        raw, finish_reason, refusal, tool_calls, usage = _extract_raw_text(resp)
+
+        if raw:
+            try:
+                return _loads_json_object(raw), SKYBOB_MODEL
+            except Exception as parse_error:
+                logger.exception(
+                    "SkyBob model returned invalid JSON. attempt=%s budget=%s model=%s finish_reason=%s refusal=%r error=%s: %s raw_preview=%r",
+                    attempt_index,
+                    budget,
+                    SKYBOB_MODEL,
+                    finish_reason,
+                    refusal,
+                    type(parse_error).__name__,
+                    str(parse_error),
+                    raw[:2000],
+                )
+                if finish_reason == "length" and attempt_index < len(retry_budgets):
+                    last_error = RuntimeError(
+                        f"O modelo {SKYBOB_MODEL} respondeu com JSON inválido após bater no limite de saída. "
+                        f"finish_reason={finish_reason} budget={budget}"
+                    )
+                    logger.warning(
+                        "SkyBob JSON parse failed after length stop; escalating budget. next_attempt=%s current_budget=%s usage=%r",
+                        attempt_index + 1,
+                        budget,
+                        usage,
+                    )
+                    continue
+                raise RuntimeError(
+                    f"O modelo {SKYBOB_MODEL} respondeu, mas não retornou JSON válido. "
+                    f"finish_reason={finish_reason} refusal={refusal!r}"
+                ) from parse_error
+
+        logger.error(
+            "SkyBob model returned empty content. attempt=%s budget=%s model=%s finish_reason=%s refusal=%r tool_calls=%r usage=%r",
+            attempt_index,
+            budget,
+            SKYBOB_MODEL,
+            finish_reason,
+            refusal,
+            tool_calls,
+            usage,
+        )
+
+        last_error = RuntimeError(
+            f"O modelo {SKYBOB_MODEL} retornou conteúdo vazio. "
+            f"finish_reason={finish_reason} refusal={refusal!r} budget={budget}"
+        )
+
+        if finish_reason == "length" and attempt_index < len(retry_budgets):
+            logger.warning(
+                "SkyBob exhausted completion budget without visible output; escalating budget. next_attempt=%s current_budget=%s usage=%r",
+                attempt_index + 1,
+                budget,
+                usage,
+            )
+            continue
+
+        break
+
+    raise last_error or RuntimeError(f"Falha inesperada ao chamar o modelo {SKYBOB_MODEL}.")
+
+
+def generate_skybob_catalog_analysis(nucleus: Dict[str, Any]) -> Dict[str, Any]:
+    context = _skybob_pick_primary_context(nucleus or {})
+    catalog_candidates = _skybob_extract_catalog_items(nucleus or {}, max_items=10)
+
+    payload = {
+        "framework": "SkyBob",
+        "mode": "catalog_analysis",
+        "objective": "Normalizar e estudar previamente os serviços/produtos do núcleo antes da geração do estudo completo, reduzindo generalismo na execução posterior.",
+        "business_context": context,
+        "nucleus_digest": _build_nucleus_digest(nucleus or {}),
+        "catalog_candidates": catalog_candidates,
+        "nucleus": nucleus or {},
+        "output_contract": {
+            "summary": "string",
+            "detected_items": [
+                {
+                    "id": "string",
+                    "name": "string",
+                    "kind": "servico|produto|oferta|categoria",
+                    "rationale": "string",
+                    "study": "string",
+                    "pains": ["string"],
+                    "desires": ["string"],
+                    "objections": ["string"],
+                    "messaging_angles": ["string"],
+                    "evidence": ["string"],
+                }
+            ],
+        },
+    }
+
+    system = """
+Você é o SkyBob em modo de pré-análise do catálogo.
+Sua função é ler o núcleo da empresa, detectar os serviços/produtos/ofertas realmente citados e criar uma leitura inicial de mercado para cada item.
+
+Regras:
+1. Trabalhe somente com o que aparece ou pode ser inferido diretamente do núcleo.
+2. Não invente linhas de produto que não existam.
+3. Agrupe apenas quando houver forte redundância semântica.
+4. A leitura de cada item precisa ser específica, não genérica.
+5. A resposta deve ser somente JSON válido.
+6. Escreva em português do Brasil.
+7. O campo study precisa já ajudar a futura geração de hooks e cards.
+""".strip()
+
+    try:
+        data, model_used = _skybob_call_json(system=system, payload=payload, temperature=0.35, max_tokens=8000)
+        raw_items = data.get("detected_items") or []
+        normalized_items: List[Dict[str, Any]] = []
+        for index, item in enumerate(raw_items if isinstance(raw_items, list) else []):
+            if not isinstance(item, dict):
+                continue
+            name = _trim_text(item.get("name"), max_chars=180)
+            if not name:
+                continue
+            normalized_items.append(
+                {
+                    "id": _trim_text(item.get("id") or f"catalog-{index+1}", max_chars=80) or f"catalog-{index+1}",
+                    "name": name,
+                    "kind": _trim_text(item.get("kind") or "oferta", max_chars=40) or "oferta",
+                    "rationale": _trim_text(item.get("rationale"), max_chars=300),
+                    "study": _trim_text(item.get("study"), max_chars=480),
+                    "pains": [_trim_text(x, max_chars=180) for x in (item.get("pains") or []) if _trim_text(x, max_chars=180)][:4],
+                    "desires": [_trim_text(x, max_chars=180) for x in (item.get("desires") or []) if _trim_text(x, max_chars=180)][:4],
+                    "objections": [_trim_text(x, max_chars=180) for x in (item.get("objections") or []) if _trim_text(x, max_chars=180)][:4],
+                    "messaging_angles": [_trim_text(x, max_chars=180) for x in (item.get("messaging_angles") or []) if _trim_text(x, max_chars=180)][:4],
+                    "evidence": [_trim_text(x, max_chars=220) for x in (item.get("evidence") or []) if _trim_text(x, max_chars=220)][:4],
+                }
+            )
+
+        if not normalized_items:
+            raise RuntimeError("Pré-análise do catálogo retornou lista vazia.")
+
+        result = {
+            "analysis_id": uuid4().hex[:12],
+            "generated_at": _skybob_timestamp(),
+            "model_used": model_used,
+            "summary": _trim_text(data.get("summary"), max_chars=700) or _trim_text(
+                f"Itens normalizados antes da execução completa do SkyBob: {', '.join(item['name'] for item in normalized_items[:5])}.",
+                max_chars=700,
+            ),
+            "detected_items": normalized_items,
+        }
+        result["serialized_text"] = _skybob_catalog_analysis_to_text(result)
+        return result
+    except Exception:
+        return _skybob_build_catalog_fallback_analysis(nucleus or {})
+
+
+def _skybob_prompt_payload(
+    nucleus: Dict[str, Any],
+    preferences: Optional[Dict[str, Any]] = None,
+    previous_study: Optional[Dict[str, Any]] = None,
+    catalog_analysis: Optional[Dict[str, Any]] = None,
+    mode: str = "full",
+) -> Dict[str, Any]:
     context = _skybob_pick_primary_context(nucleus or {})
     catalog_items = _skybob_extract_catalog_items(nucleus or {}, max_items=10)
 
-    return {
+    base_payload = {
         "framework": "SkyBob",
-        "model": "gpt-5.4",
-        "objective": "Construir um estudo estratégico de calendário editorial a partir do núcleo da empresa, identificando padrões de conteúdo que já performam no nicho e gerando um banco inicial de hooks filtráveis pelo gosto do usuário.",
+        "model": SKYBOB_MODEL,
+        "mode": mode,
+        "objective": "Construir ou refinar o estudo estratégico do SkyBob a partir do núcleo da empresa, com foco em precisão de nicho e hooks menos genéricos.",
         "business_context": context,
         "catalog_items_detected": catalog_items,
+        "catalog_analysis": catalog_analysis or {},
         "original_instructions_preserved": {
             "mapeamento": [
                 "Os principais tipos de vídeos que já performam bem nesse nicho.",
@@ -3820,13 +5077,6 @@ def _skybob_prompt_payload(nucleus: Dict[str, Any], preferences: Optional[Dict[s
                 "Explicar por que cada hook combina com esse negócio.",
                 "Sinalizar o formato de vídeo mais promissor para cada hook.",
             ],
-            "ganchos_visuais": ["Print", "Mapa", "Texto grande", "Antes/depois", "Close no rosto", "Tela gravada"],
-            "emocoes": ["Medo de perder dinheiro", "Curiosidade", "Indignação", "Alívio", "Sensação de descoberta"],
-            "sintese": [
-                "Resumir os 5 maiores padrões de sucesso do nicho.",
-                "Listar os erros mais comuns que fazem conteúdos não performarem.",
-                "Apontar oportunidades de diferenciação para criar conteúdos melhores, mais claros e mais úteis do que a média do nicho.",
-            ],
             "rules": [
                 "Não copiar criadores específicos.",
                 "Não citar nomes de perfis.",
@@ -3840,7 +5090,37 @@ def _skybob_prompt_payload(nucleus: Dict[str, Any], preferences: Optional[Dict[s
         "nucleus": nucleus or {},
         "feedback_preferences": preferences or {},
         "previous_study": previous_study or {},
-        "output_contract": {
+    }
+
+    if mode == "refine":
+        base_payload["output_contract"] = {
+            "hook_strategy": {
+                "positioning_summary": "string",
+                "preferred_angles": ["string"],
+                "angles_to_reduce": ["string"],
+            },
+            "hooks": [
+                {
+                    "hook": "string",
+                    "angle": "erro|oportunidade|diagnostico|objecao|prova|bastidor|comparativo|mito",
+                    "format_hint": "string",
+                    "use_case": "string",
+                    "why_it_matches": "string",
+                    "tags": ["string"],
+                }
+            ],
+            "cards": [
+                {
+                    "section": "hooks|formats|patterns|mistakes|opportunities|calendar",
+                    "title": "string",
+                    "body": "string",
+                    "bullets": ["string"],
+                    "badges": ["string"]
+                }
+            ],
+        }
+    else:
+        base_payload["output_contract"] = {
             "overview": "string",
             "success_patterns": ["string", "string", "string", "string", "string"],
             "mistakes": ["string"],
@@ -3852,10 +5132,9 @@ def _skybob_prompt_payload(nucleus: Dict[str, Any], preferences: Optional[Dict[s
             },
             "hooks": [
                 {
-                    "id": "string",
                     "hook": "string",
                     "angle": "erro|oportunidade|diagnostico|objecao|prova|bastidor|comparativo|mito",
-                    "format_hint": "um dos 12 formatos base",
+                    "format_hint": "string",
                     "use_case": "string",
                     "why_it_matches": "string",
                     "tags": ["string"],
@@ -3863,7 +5142,6 @@ def _skybob_prompt_payload(nucleus: Dict[str, Any], preferences: Optional[Dict[s
             ],
             "cards": [
                 {
-                    "id": "string",
                     "section": "overview|viral|hooks|formats|patterns|mistakes|opportunities|calendar",
                     "title": "string",
                     "body": "string",
@@ -3872,11 +5150,17 @@ def _skybob_prompt_payload(nucleus: Dict[str, Any], preferences: Optional[Dict[s
                 }
             ],
             "calendar_recommendations": ["string"],
-        },
-    }
+        }
+
+    return base_payload
 
 
-def _skybob_build_fallback_hooks(nucleus: Dict[str, Any], preferences: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+def _skybob_build_fallback_hooks(
+    nucleus: Dict[str, Any],
+    *,
+    preferences: Optional[Dict[str, Any]] = None,
+    run_id: str,
+) -> List[Dict[str, Any]]:
     context = _skybob_pick_primary_context(nucleus or {})
     catalog_items = _skybob_extract_catalog_items(nucleus or {}, max_items=8)
     if not catalog_items:
@@ -3950,42 +5234,72 @@ def _skybob_build_fallback_hooks(nucleus: Dict[str, Any], preferences: Optional[
         compare_text = f"{hook_text} {' '.join(template['tags'])}".lower()
         if disliked_terms and any(term and term in compare_text for term in disliked_terms.split()):
             continue
-        if liked_terms and not any(term and term in compare_text for term in liked_terms.split()):
-            # keep diversity even when likes exist, but slightly bias the first items later
-            pass
-        hooks.append({
-            "id": f"hook-{index+1}",
-            "hook": _trim_text(hook_text, max_chars=220),
-            "angle": template["angle"],
-            "format_hint": template["format_hint"],
-            "use_case": _trim_text(template["use_case"], max_chars=220),
-            "why_it_matches": _trim_text(
-                f"{template['why']} No contexto atual, isso conversa com {diferenciais}.",
-                max_chars=320,
-            ),
-            "tags": [_trim_text(tag, max_chars=40) for tag in template["tags"] if _trim_text(tag, max_chars=40)],
-        })
-        if len(hooks) >= 8:
-            break
+        hooks.append(
+            {
+                "id": _skybob_make_scoped_id("hook", run_id, hook_text, index),
+                "hook": _trim_text(hook_text, max_chars=220),
+                "angle": template["angle"],
+                "format_hint": template["format_hint"],
+                "use_case": _trim_text(template["use_case"], max_chars=220),
+                "why_it_matches": _trim_text(
+                    f"{template['why']} No contexto atual, isso conversa com {diferenciais}.",
+                    max_chars=320,
+                ),
+                "tags": [_trim_text(tag, max_chars=40) for tag in template["tags"] if _trim_text(tag, max_chars=40)],
+            }
+        )
 
-    if not hooks:
-        hooks.append({
-            "id": "hook-1",
-            "hook": "O que quase ninguém percebe quando fala sobre o seu nicho",
-            "angle": "diagnostico",
-            "format_hint": "Diagnóstico ou opinião rápida",
-            "use_case": "Vídeo rápido para abrir uma linha editorial mais estratégica.",
-            "why_it_matches": "Fallback seguro quando o núcleo ainda está incompleto.",
-            "tags": ["diagnóstico", "nicho", "estratégia"],
-        })
+    if liked_terms:
+        liked_parts = [part for part in liked_terms.split() if len(part) >= 4]
+        hooks.sort(
+            key=lambda item: 0
+            if any(part in f"{item.get('hook','')} {item.get('angle','')} {' '.join(item.get('tags') or [])}".lower() for part in liked_parts)
+            else 1
+        )
 
-    return hooks
+    return hooks[:12]
+
+
+
+def _skybob_hook_compare_key(value: Any) -> str:
+    text = _trim_text(value, max_chars=260).lower()
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", ascii_text).strip()
+
+
+def _skybob_collect_blocked_hook_keys(
+    preferences: Optional[Dict[str, Any]] = None,
+    previous_study: Optional[Dict[str, Any]] = None,
+) -> set[str]:
+    values: List[str] = []
+
+    for key in ["seen_hooks", "liked_hooks", "disliked_hooks"]:
+        values.extend(_coerce_string_list((preferences or {}).get(key), max_items=200, max_chars=260))
+
+    if isinstance(previous_study, dict):
+        for item in previous_study.get("hooks") or []:
+            if isinstance(item, dict):
+                values.append(str(item.get("hook") or ""))
+            elif isinstance(item, str):
+                values.append(item)
+
+    return {
+        compare_key
+        for compare_key in (_skybob_hook_compare_key(item) for item in values)
+        if compare_key
+    }
 
 
 def _skybob_normalize_hooks(
     raw_hooks: Any,
     nucleus: Dict[str, Any],
+    *,
     preferences: Optional[Dict[str, Any]] = None,
+    previous_study: Optional[Dict[str, Any]] = None,
+    run_id: str,
 ) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
 
@@ -3995,15 +5309,17 @@ def _skybob_normalize_hooks(
                 clean_hook = _trim_text(item, max_chars=220)
                 if not clean_hook:
                     continue
-                normalized.append({
-                    "id": f"hook-{index+1}",
-                    "hook": clean_hook,
-                    "angle": "diagnostico",
-                    "format_hint": "Diagnóstico ou opinião rápida",
-                    "use_case": "",
-                    "why_it_matches": "",
-                    "tags": [],
-                })
+                normalized.append(
+                    {
+                        "id": _skybob_make_scoped_id("hook", run_id, clean_hook, index),
+                        "hook": clean_hook,
+                        "angle": "diagnostico",
+                        "format_hint": "Diagnóstico ou opinião rápida",
+                        "use_case": "",
+                        "why_it_matches": "",
+                        "tags": [],
+                    }
+                )
                 continue
 
             if not isinstance(item, dict):
@@ -4014,39 +5330,119 @@ def _skybob_normalize_hooks(
                 continue
 
             tags = item.get("tags") or item.get("badges") or []
-            normalized.append({
-                "id": _trim_text(item.get("id") or f"hook-{index+1}", max_chars=120) or f"hook-{index+1}",
-                "hook": hook_text,
-                "angle": _trim_text(item.get("angle") or "diagnostico", max_chars=80) or "diagnostico",
-                "format_hint": _trim_text(item.get("format_hint") or item.get("format") or "Diagnóstico ou opinião rápida", max_chars=120) or "Diagnóstico ou opinião rápida",
-                "use_case": _trim_text(item.get("use_case") or item.get("context") or "", max_chars=240),
-                "why_it_matches": _trim_text(item.get("why_it_matches") or item.get("why") or "", max_chars=320),
-                "tags": [
-                    _trim_text(tag, max_chars=40)
-                    for tag in (tags if isinstance(tags, list) else _coerce_string_list(tags, max_items=8, max_chars=40))
-                    if _trim_text(tag, max_chars=40)
-                ],
-            })
+            normalized.append(
+                {
+                    "id": _skybob_make_scoped_id("hook", run_id, item.get("id") or hook_text, index),
+                    "hook": hook_text,
+                    "angle": _trim_text(item.get("angle") or "diagnostico", max_chars=80) or "diagnostico",
+                    "format_hint": _trim_text(item.get("format_hint") or item.get("format") or "Diagnóstico ou opinião rápida", max_chars=120)
+                    or "Diagnóstico ou opinião rápida",
+                    "use_case": _trim_text(item.get("use_case") or item.get("context") or "", max_chars=240),
+                    "why_it_matches": _trim_text(item.get("why_it_matches") or item.get("why") or "", max_chars=320),
+                    "tags": [
+                        _trim_text(tag, max_chars=40)
+                        for tag in (tags if isinstance(tags, list) else _coerce_string_list(tags, max_items=8, max_chars=40))
+                        if _trim_text(tag, max_chars=40)
+                    ],
+                }
+            )
 
-    if not normalized:
-        normalized = _skybob_build_fallback_hooks(nucleus, preferences=preferences)
+    blocked_keys = _skybob_collect_blocked_hook_keys(preferences=preferences, previous_study=previous_study)
 
     seen = set()
     deduped: List[Dict[str, Any]] = []
     for item in normalized:
-        key = str(item.get("hook") or "").strip().lower()
-        if not key or key in seen:
+        key = _skybob_hook_compare_key(item.get("hook"))
+        if not key or key in seen or key in blocked_keys:
             continue
         seen.add(key)
         deduped.append(item)
         if len(deduped) >= 12:
             break
 
+    if len(deduped) < 8:
+        fallback_hooks = _skybob_build_fallback_hooks(nucleus, preferences=preferences, run_id=run_id)
+        for item in fallback_hooks:
+            key = _skybob_hook_compare_key(item.get("hook"))
+            if not key or key in seen or key in blocked_keys:
+                continue
+            seen.add(key)
+            deduped.append(item)
+            if len(deduped) >= 12:
+                break
+
     return deduped
+
+
+def _skybob_normalize_cards(raw_cards: Any, hooks: List[Dict[str, Any]], *, run_id: str) -> List[Dict[str, Any]]:
+    normalized_cards: List[Dict[str, Any]] = []
+    if isinstance(raw_cards, list):
+        for index, item in enumerate(raw_cards):
+            if not isinstance(item, dict):
+                continue
+            title = _trim_text(item.get("title") or f"Bloco {index+1}", max_chars=240) or f"Bloco {index+1}"
+            normalized_cards.append(
+                {
+                    "id": _skybob_make_scoped_id("card", run_id, item.get("id") or title, index),
+                    "section": _trim_text(item.get("section") or "patterns", max_chars=80) or "patterns",
+                    "title": title,
+                    "body": _trim_text(item.get("body") or "", max_chars=4000),
+                    "bullets": [_trim_text(b, max_chars=500) for b in (item.get("bullets") or []) if _trim_text(b, max_chars=500)],
+                    "badges": [_trim_text(b, max_chars=80) for b in (item.get("badges") or []) if _trim_text(b, max_chars=80)],
+                }
+            )
+
+    if len(normalized_cards) < 4:
+        for index, hook in enumerate(hooks[:4], start=len(normalized_cards)):
+            normalized_cards.append(
+                {
+                    "id": _skybob_make_scoped_id("card", run_id, hook.get("id") or hook.get("hook"), index),
+                    "section": "hooks",
+                    "title": _trim_text(hook.get("hook"), max_chars=240) or "Hook recomendado",
+                    "body": _trim_text(hook.get("why_it_matches"), max_chars=4000) or _trim_text(hook.get("use_case"), max_chars=4000),
+                    "bullets": [
+                        text
+                        for text in [
+                            _trim_text(hook.get("use_case"), max_chars=500),
+                            f"Formato sugerido: {_trim_text(hook.get('format_hint'), max_chars=120)}"
+                            if _trim_text(hook.get("format_hint"), max_chars=120)
+                            else "",
+                        ]
+                        if text
+                    ],
+                    "badges": [
+                        text
+                        for text in [
+                            _trim_text(hook.get("angle"), max_chars=80),
+                            *[_trim_text(tag, max_chars=80) for tag in (hook.get("tags") or [])[:2] if _trim_text(tag, max_chars=80)],
+                        ]
+                        if text
+                    ],
+                }
+            )
+
+    return normalized_cards
 
 
 def _skybob_study_to_text(study: Dict[str, Any]) -> str:
     lines: List[str] = ["SkyBob", "", "Visão geral do nicho", str(study.get("overview") or "").strip(), ""]
+
+    catalog_analysis = study.get("catalog_analysis") or {}
+    if isinstance(catalog_analysis, dict):
+        summary = _trim_text(catalog_analysis.get("summary"))
+        detected_items = catalog_analysis.get("detected_items") or []
+        if summary or detected_items:
+            lines.append("Serviços e produtos detectados")
+            if summary:
+                lines.append(summary)
+            for item in detected_items[:6]:
+                if not isinstance(item, dict):
+                    continue
+                name = _trim_text(item.get("name"))
+                rationale = _trim_text(item.get("rationale"))
+                if name:
+                    lines.append(f"- {name}: {rationale}" if rationale else f"- {name}")
+            lines.append("")
 
     mapping = [
         ("Padrões de sucesso", study.get("success_patterns") or []),
@@ -4108,8 +5504,76 @@ def _skybob_study_to_text(study: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-def generate_skybob_study(nucleus: Dict[str, Any], preferences: Optional[Dict[str, Any]] = None, previous_study: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    _require_key()
+def _skybob_build_fallback_foundation(nucleus: Dict[str, Any], catalog_analysis: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    context = _skybob_pick_primary_context(nucleus or {})
+    detected_names = [
+        _trim_text((item or {}).get("name"), max_chars=120)
+        for item in ((catalog_analysis or {}).get("detected_items") or [])
+        if _trim_text((item or {}).get("name"), max_chars=120)
+    ]
+    if not detected_names:
+        detected_names = _skybob_extract_catalog_items(nucleus or {}, max_items=5)
+
+    offer_reference = ", ".join(detected_names[:3]) if detected_names else (context.get("oferta") or "a oferta principal")
+    publico = context.get("publico") if context.get("publico") != "não informado" else "o público ideal"
+    diferenciais = context.get("diferenciais") if context.get("diferenciais") != "não informado" else "a forma própria de executar"
+
+    return {
+        "overview": _trim_text(
+            f"O SkyBob identificou que o conteúdo precisa ancorar mais em {offer_reference}, conectando a oferta a dores, objeções e critérios de decisão de {publico}.",
+            max_chars=1200,
+        ),
+        "success_patterns": [
+            _trim_text(f"Conteúdos que recortam um problema concreto ligado a {offer_reference} tendem a parecer mais úteis.", max_chars=220),
+            _trim_text("Explicações curtas, com tese clara logo no começo, costumam sustentar melhor a retenção.", max_chars=220),
+            _trim_text("Prova prática, bastidor e contraste entre certo e errado normalmente geram mais autoridade que frases vagas.", max_chars=220),
+            _trim_text("Formatos de diagnóstico e checklist ajudam o público a se reconhecer no problema antes da solução.", max_chars=220),
+            _trim_text(f"Diferenciais reais como {diferenciais} precisam aparecer em situações concretas, não só em promessa.", max_chars=220),
+        ],
+        "mistakes": [
+            _trim_text("Falar do nicho de forma ampla demais e sem recorte de dor, contexto ou decisão.", max_chars=220),
+            _trim_text("Usar hooks que serviriam para qualquer empresa, sem conexão com a oferta real.", max_chars=220),
+            _trim_text("Explicar benefícios sem mostrar critérios, objeções ou aplicação prática.", max_chars=220),
+        ],
+        "opportunities": [
+            _trim_text(f"Criar séries por item de oferta, começando por {offer_reference}.", max_chars=220),
+            _trim_text("Trabalhar mais diagnóstico, comparação, objeção e bastidor como matriz editorial.", max_chars=220),
+            _trim_text("Transformar perguntas frequentes e travas de decisão em hooks específicos.", max_chars=220),
+        ],
+        "calendar_recommendations": [
+            _trim_text("Abrir a semana com diagnóstico curto de erro ou sintoma.", max_chars=220),
+            _trim_text("Usar meio de semana para prova, bastidor ou comparação prática.", max_chars=220),
+            _trim_text("Fechar a sequência com objeção, checklist ou decisão guiada.", max_chars=220),
+        ],
+    }
+
+
+def _skybob_merge_with_previous(previous_study: Dict[str, Any], partial_study: Dict[str, Any]) -> Dict[str, Any]:
+    merged = {
+        "overview": previous_study.get("overview") or partial_study.get("overview") or "",
+        "success_patterns": previous_study.get("success_patterns") or partial_study.get("success_patterns") or [],
+        "mistakes": previous_study.get("mistakes") or partial_study.get("mistakes") or [],
+        "opportunities": previous_study.get("opportunities") or partial_study.get("opportunities") or [],
+        "calendar_recommendations": previous_study.get("calendar_recommendations") or partial_study.get("calendar_recommendations") or [],
+        "hook_strategy": partial_study.get("hook_strategy") or previous_study.get("hook_strategy") or {},
+        "hooks": partial_study.get("hooks") or [],
+        "cards": partial_study.get("cards") or [],
+    }
+    return merged
+
+
+def generate_skybob_study(
+    nucleus: Dict[str, Any],
+    *,
+    preferences: Optional[Dict[str, Any]] = None,
+    previous_study: Optional[Dict[str, Any]] = None,
+    catalog_analysis: Optional[Dict[str, Any]] = None,
+    mode: str = "full",
+) -> Dict[str, Any]:
+    mode = "refine" if str(mode or "").lower() == "refine" else "full"
+    run_id = uuid4().hex[:12]
+    resolved_catalog_analysis = catalog_analysis or generate_skybob_catalog_analysis(nucleus or {})
+    fallback_foundation = _skybob_build_fallback_foundation(nucleus or {}, resolved_catalog_analysis)
 
     system = """
 Você é o SkyBob, um estrategista editorial sênior focado em padrões de mercado, estrutura de conteúdo, engenharia de hook e clareza prática.
@@ -4118,124 +5582,56 @@ Sua missão é analisar o nicho com base no núcleo da empresa e produzir um est
 
 Prioridades do SkyBob:
 1. Consumir o núcleo inteiro, com atenção máxima a serviços, produtos, público, diferenciais, restrições e provas.
-2. Gerar um estudo sólido do nicho.
-3. Entregar um Hook Lab inicial, com hooks relacionados à oferta real da empresa.
-4. Quando houver feedback do usuário sobre hooks curtidos e rejeitados, adaptar a próxima geração para se aproximar do gosto validado e reduzir padrões rejeitados.
+2. Usar a pré-análise do catálogo como fonte principal para reduzir generalismo.
+3. Entregar hooks relacionados à oferta real da empresa.
+4. Quando houver feedback do usuário, adaptar a próxima geração para se aproximar do gosto validado e reduzir padrões rejeitados.
 5. Evitar hooks genéricos que serviriam para qualquer empresa.
 
 Regras obrigatórias:
-1. Preserve a essência exata do método SkyBob recebido.
-2. Não cite nomes de perfis, influenciadores ou criadores específicos.
-3. Trabalhe com padrões de mercado, estruturas, hooks, formatos e repetições observáveis.
-4. Use os serviços e produtos do núcleo para concretizar hooks.
-5. Cada hook precisa ter tese clara, promessa plausível e aplicação prática.
-6. Não invente métricas ou números exatos sem base. Use linguagem como tende a, costuma, aparece com frequência, normalmente.
-7. Não entregue modinhas passageiras como se fossem estratégia.
-8. Gere saída somente em JSON válido.
-9. Cada card precisa ser independente, útil e movível na interface.
-10. Cada hook precisa ser independente, curto o suficiente para a UI e forte o suficiente para virar roteiro.
-11. Quando houver feedback do usuário sobre o que gostou e não gostou, refine a próxima resposta para se aproximar do que foi bem avaliado e reduzir o que foi mal avaliado.
-12. A resposta precisa ser escrita em português do Brasil.
-13. Não resuma demais. A profundidade é desejável quando ela aumentar clareza, aplicabilidade e valor estratégico.
-14. Prefira hooks com recorte de dor, erro, diagnóstico, objeção, prova, bastidor e contraste ao invés de frases vagas.
-15. Se o núcleo estiver incompleto, continue útil sem inventar fatos do negócio.
-16. Na escrita dos hooks, nunca use travessão.
-17. Na escrita dos hooks, evite ao máximo as palavras: ruído, resultados reais, clareza, contexto, robusto, transforme, elevar, maximizar.
-18. Na escrita dos hooks, nunca use frases genéricas como: tenha mais clareza, venda mais com estratégia, gere mais valor, aumente sua performance, outro nível, subir de nível.
-19. Na escrita dos hooks, nunca use emoji.
-20. Na escrita dos hooks, prefira linguagem específica, concreta e conectada ao nicho, à oferta, ao problema, à objeção ou ao cenário real do público.
+1. Não cite nomes de perfis, influenciadores ou criadores específicos.
+2. Trabalhe com padrões de mercado, estruturas, hooks, formatos e repetições observáveis.
+3. Use os serviços e produtos do núcleo para concretizar hooks.
+4. Cada hook precisa ter tese clara, promessa plausível e aplicação prática.
+5. Não invente métricas ou números exatos sem base.
+6. Gere saída somente em JSON válido.
+7. Cada card precisa ser independente, útil e movível na interface.
+8. A resposta precisa ser escrita em português do Brasil.
+9. Na escrita dos hooks, nunca use emoji.
+10. Na escrita dos hooks, prefira linguagem específica, concreta e conectada ao nicho, à oferta, ao problema, à objeção ou ao cenário real do público.
 """.strip()
 
-    payload = _skybob_prompt_payload(nucleus, preferences=preferences, previous_study=previous_study)
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": _json_dumps(payload)},
-    ]
+    if mode == "refine":
+        system += """
 
-    preferred_model = (OPENAI_MODEL or "gpt-5.4").strip()
-    fallback_models = [preferred_model]
-    for candidate in ["gpt-5.4", "gpt-4.1"]:
-        if candidate and candidate not in fallback_models:
-            fallback_models.append(candidate)
+Modo refine:
+- Você NÃO deve reescrever a base inteira do estudo anterior.
+- Preserve a fundação do estudo anterior e gere somente uma nova direção de hooks, novos hooks e novos cards ligados ao feedback.
+- Os hooks e cards devem responder ao feedback salvo pelo usuário, inclusive likes, dislikes, edições e notas.
+- É obrigatório evitar repetir literalmente hooks já apresentados antes ou hooks presentes no feedback salvo.
+"""
 
-    last_error: Exception | None = None
-    raw = ""
-    for model_name in fallback_models:
-        try:
-            client = OpenAI(
-                api_key=OPENAI_API_KEY,
-                timeout=180.0,
-                max_retries=1,
-            )
-            try:
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=0.55,
-                    response_format={"type": "json_object"},
-                )
-            except Exception:
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=0.55,
-                )
-            raw = (resp.choices[0].message.content or "").strip()
-            data = _loads_json_object(raw)
-            if isinstance(data, dict):
-                break
-        except Exception as e:
-            last_error = e
-            data = None
-            continue
-    else:
-        raise RuntimeError(f"Falha ao executar o SkyBob no provedor de IA: {last_error}")
+    payload = _skybob_prompt_payload(
+        nucleus,
+        preferences=preferences,
+        previous_study=previous_study,
+        catalog_analysis=resolved_catalog_analysis,
+        mode=mode,
+    )
 
-    hooks = _skybob_normalize_hooks(data.get("hooks"), nucleus, preferences=preferences)
+    try:
+        data, model_used = _skybob_call_json(system=system, payload=payload, temperature=0.5 if mode == "full" else 0.45, max_tokens=12000 if mode == "full" else 8000)
+    except Exception:
+        data = {}
+        model_used = "fallback-local"
 
-    cards = data.get("cards")
-    normalized_cards: List[Dict[str, Any]] = []
-    if isinstance(cards, list):
-        for index, item in enumerate(cards):
-            if not isinstance(item, dict):
-                continue
-            normalized_cards.append({
-                "id": _trim_text(item.get("id") or f"card-{index+1}", max_chars=120) or f"card-{index+1}",
-                "section": _trim_text(item.get("section") or "patterns", max_chars=80) or "patterns",
-                "title": _trim_text(item.get("title") or f"Bloco {index+1}", max_chars=240) or f"Bloco {index+1}",
-                "body": _trim_text(item.get("body") or "", max_chars=4000),
-                "bullets": [
-                    _trim_text(b, max_chars=500)
-                    for b in (item.get("bullets") or [])
-                    if _trim_text(b, max_chars=500)
-                ],
-                "badges": [
-                    _trim_text(b, max_chars=80)
-                    for b in (item.get("badges") or [])
-                    if _trim_text(b, max_chars=80)
-                ],
-            })
-
-    if len(normalized_cards) < 4:
-        for hook in hooks[:4]:
-            normalized_cards.append({
-                "id": f"card-hook-{hook.get('id')}",
-                "section": "hooks",
-                "title": _trim_text(hook.get("hook"), max_chars=240) or "Hook recomendado",
-                "body": _trim_text(hook.get("why_it_matches"), max_chars=4000) or _trim_text(hook.get("use_case"), max_chars=4000),
-                "bullets": [
-                    text for text in [
-                        _trim_text(hook.get("use_case"), max_chars=500),
-                        f"Formato sugerido: {_trim_text(hook.get('format_hint'), max_chars=120)}" if _trim_text(hook.get("format_hint"), max_chars=120) else "",
-                    ] if text
-                ],
-                "badges": [
-                    text for text in [
-                        _trim_text(hook.get("angle"), max_chars=80),
-                        *[_trim_text(tag, max_chars=80) for tag in (hook.get("tags") or [])[:2] if _trim_text(tag, max_chars=80)],
-                    ] if text
-                ],
-            })
+    hooks = _skybob_normalize_hooks(
+        data.get("hooks"),
+        nucleus,
+        preferences=preferences,
+        previous_study=previous_study if mode == "refine" else None,
+        run_id=run_id,
+    )
+    cards = _skybob_normalize_cards(data.get("cards"), hooks, run_id=run_id)
 
     raw_hook_strategy = data.get("hook_strategy") or {}
     hook_strategy = {
@@ -4255,19 +5651,35 @@ Regras obrigatórias:
             if _trim_text(x, max_chars=240)
         ],
     }
-
     if not hook_strategy["preferred_angles"]:
         hook_strategy["preferred_angles"] = sorted({str(item.get("angle")).strip() for item in hooks if str(item.get("angle") or "").strip()})[:5]
 
-    result = {
-        "overview": _trim_text(data.get("overview"), max_chars=12000),
-        "success_patterns": [_trim_text(x, max_chars=1000) for x in (data.get("success_patterns") or []) if _trim_text(x, max_chars=1000)],
-        "mistakes": [_trim_text(x, max_chars=1000) for x in (data.get("mistakes") or []) if _trim_text(x, max_chars=1000)],
-        "opportunities": [_trim_text(x, max_chars=1000) for x in (data.get("opportunities") or []) if _trim_text(x, max_chars=1000)],
-        "calendar_recommendations": [_trim_text(x, max_chars=1000) for x in (data.get("calendar_recommendations") or []) if _trim_text(x, max_chars=1000)],
+    base_result = {
+        "overview": _trim_text(data.get("overview"), max_chars=12000) or fallback_foundation["overview"],
+        "success_patterns": [_trim_text(x, max_chars=1000) for x in (data.get("success_patterns") or []) if _trim_text(x, max_chars=1000)]
+        or fallback_foundation["success_patterns"],
+        "mistakes": [_trim_text(x, max_chars=1000) for x in (data.get("mistakes") or []) if _trim_text(x, max_chars=1000)]
+        or fallback_foundation["mistakes"],
+        "opportunities": [_trim_text(x, max_chars=1000) for x in (data.get("opportunities") or []) if _trim_text(x, max_chars=1000)]
+        or fallback_foundation["opportunities"],
+        "calendar_recommendations": [
+            _trim_text(x, max_chars=1000) for x in (data.get("calendar_recommendations") or []) if _trim_text(x, max_chars=1000)
+        ]
+        or fallback_foundation["calendar_recommendations"],
         "hook_strategy": hook_strategy,
         "hooks": hooks,
-        "cards": normalized_cards,
+        "cards": cards,
     }
+
+    if mode == "refine" and isinstance(previous_study, dict) and previous_study:
+        result = _skybob_merge_with_previous(previous_study, base_result)
+    else:
+        result = base_result
+
+    result["run_id"] = run_id
+    result["mode"] = mode
+    result["model_used"] = model_used
+    result["generated_at"] = _skybob_timestamp()
+    result["catalog_analysis"] = resolved_catalog_analysis
     result["serialized_text"] = _skybob_study_to_text(result)
     return result

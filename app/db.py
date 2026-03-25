@@ -9,14 +9,26 @@ connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite")
 engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
 
 
+def _ensure_sqlite_table_columns(table_name: str, wanted: dict[str, str]) -> None:
+    with engine.begin() as conn:
+        result = conn.execute(text(f"PRAGMA table_info('{table_name}')"))
+        rows = result.fetchall()
+        if not rows:
+            return
+
+        existing = {row[1] for row in rows}
+        for column, sql_type in wanted.items():
+            if column not in existing:
+                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column} {sql_type}"))
+
+
 def _ensure_sqlite_columns() -> None:
     if not DATABASE_URL.startswith("sqlite"):
         return
 
-    with engine.begin() as conn:
-        result = conn.execute(text("PRAGMA table_info('user')"))
-        existing = {row[1] for row in result.fetchall()}
-        wanted = {
+    _ensure_sqlite_table_columns(
+        "user",
+        {
             "instagram_meta_access_token": "TEXT",
             "instagram_meta_token_expires_at": "TIMESTAMP",
             "instagram_account_id": "TEXT",
@@ -59,10 +71,15 @@ def _ensure_sqlite_columns() -> None:
             "google_business_location_category": "TEXT",
             "google_business_locations_json": "TEXT",
             "skybob": "TEXT",
-        }
-        for column, sql_type in wanted.items():
-            if column not in existing:
-                conn.execute(text(f"ALTER TABLE user ADD COLUMN {column} {sql_type}"))
+        },
+    )
+
+    _ensure_sqlite_table_columns(
+        "bobar_card",
+        {
+            "structure_json": "TEXT",
+        },
+    )
 
 
 def init_db() -> None:

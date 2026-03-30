@@ -20,7 +20,7 @@ class User(SQLModel, table=True):
     hashed_password: Optional[str] = Field(default=None)
     google_id: Optional[str] = Field(default=None, index=True)
 
-    credits: int = Field(default=100)
+    credits: int = Field(default=12_000)
     last_credit_reset: datetime = Field(default_factory=utcnow)
 
     linkedin_access_token: Optional[str] = Field(default=None)

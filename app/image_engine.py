@@ -22,12 +22,17 @@ from .image_local_edit import (
     should_use_local_text_render,
     should_use_localized_edit,
 )
-from fastapi import APIRouter, Depends, File, Form, UploadFile, HTTPException
+from fastapi import APIRouter, Depends, File, Form, UploadFile, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from sqlmodel import Session, select
 
+from .credits import (
+    attach_credit_headers,
+    charge_credits,
+    ensure_credits,
+)
 from .db import get_session
 from .deps import get_current_user
 from .models import ImageEngineProject, User
@@ -1451,40 +1456,45 @@ async def _edit_openai_image(
         "raw": body,
     }
 @router.post("/api/image-engine/stream")
-async def image_engine_stream(body: ImageEngineRequest, current_user: User = Depends(get_current_user)):
+async def image_engine_stream(
+    body: ImageEngineRequest,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
     openai_key = os.getenv("OPENAI_API_KEY")
     fal_key = os.getenv("FAL_KEY")
     gemini_key = os.getenv("GEMINI_API_KEY")
 
+    if not openai_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY não configurada.")
+    if not fal_key:
+        raise HTTPException(status_code=500, detail="FAL_KEY não configurada.")
+    if not gemini_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY não configurada.")
+
+    try:
+        requested_dimensions = _resolve_target_dimensions(body.width, body.height)
+        aspect_ratio = _normalize_aspect_ratio(body.formato)
+        openai_quality = _normalize_quality(body.qualidade)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if requested_dimensions:
+        base_width, base_height = _choose_best_supported_base_size(*requested_dimensions)
+        engine_aspect_ratio = _base_size_to_aspect_ratio(base_width, base_height)
+        openai_size = f"{base_width}x{base_height}"
+    else:
+        engine_aspect_ratio = aspect_ratio
+        openai_size = _openai_size_from_aspect_ratio(engine_aspect_ratio)
+
+    asset_type = _asset_type_from_context(None, engine_aspect_ratio)
+    preset = _marketing_preset(asset_type, None)
+
+    ensure_credits(current_user, "image_generate_from_scratch")
+    action = charge_credits(session, current_user, "image_generate_from_scratch")
+
     async def event_generator():
-        if not openai_key:
-            yield _sse({"error": "OPENAI_API_KEY não configurada."})
-            return
-
-        if not fal_key:
-            yield _sse({"error": "FAL_KEY não configurada."})
-            return
-
-        if not gemini_key:
-            yield _sse({"error": "GEMINI_API_KEY não configurada."})
-            return
-
         try:
-            requested_dimensions = _resolve_target_dimensions(body.width, body.height)
-            aspect_ratio = _normalize_aspect_ratio(body.formato)
-            openai_quality = _normalize_quality(body.qualidade)
-
-            if requested_dimensions:
-                base_width, base_height = _choose_best_supported_base_size(*requested_dimensions)
-                engine_aspect_ratio = _base_size_to_aspect_ratio(base_width, base_height)
-                openai_size = f"{base_width}x{base_height}"
-            else:
-                engine_aspect_ratio = aspect_ratio
-                openai_size = _openai_size_from_aspect_ratio(engine_aspect_ratio)
-
-            asset_type = _asset_type_from_context(None, engine_aspect_ratio)
-            preset = _marketing_preset(asset_type, None)
-
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
                 yield _sse({
                     "status": "Analisando briefing e refinando o prompt com foco em direção de arte publicitária...",
@@ -1628,7 +1638,7 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
         except Exception as e:
             yield _sse({"error": f"Erro interno no motor: {str(e)}"})
 
-    return StreamingResponse(
+    stream_response = StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
@@ -1637,6 +1647,14 @@ async def image_engine_stream(body: ImageEngineRequest, current_user: User = Dep
             "X-Accel-Buffering": "no",
         },
     )
+    attach_credit_headers(
+        stream_response,
+        current_user,
+        charged_credits=action.credits,
+        action_key=action.key,
+    )
+    return stream_response
+
 
 
 @router.post("/api/image-engine/edit/stream")
@@ -1648,10 +1666,11 @@ async def image_engine_edit_stream(
     width: Optional[int] = Form(None),
     height: Optional[int] = Form(None),
     current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
 ):
-    del current_user
-
     openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY não configurada.")
 
     image_bytes = await reference_image.read()
     image_filename = reference_image.filename or "reference.png"
@@ -1665,29 +1684,29 @@ async def image_engine_edit_stream(
         height=height,
     )
 
+    try:
+        _validate_reference_image(image_bytes, image_content_type)
+        if not body.instrucoes_edicao.strip():
+            raise ValueError("As instruções de edição são obrigatórias.")
+        requested_dimensions = _resolve_target_dimensions(body.width, body.height)
+        aspect_ratio = _normalize_aspect_ratio(body.formato)
+        openai_quality = _normalize_quality(body.qualidade)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if requested_dimensions:
+        base_width, base_height = _choose_best_supported_base_size(*requested_dimensions)
+        engine_aspect_ratio = _base_size_to_aspect_ratio(base_width, base_height)
+        openai_size = f"{base_width}x{base_height}"
+    else:
+        engine_aspect_ratio = aspect_ratio
+        openai_size = _openai_size_from_aspect_ratio(engine_aspect_ratio)
+
+    ensure_credits(current_user, "image_edit")
+    action = charge_credits(session, current_user, "image_edit")
+
     async def event_generator():
-        if not openai_key:
-            yield _sse({"error": "OPENAI_API_KEY não configurada."})
-            return
-
         try:
-            _validate_reference_image(image_bytes, image_content_type)
-
-            if not body.instrucoes_edicao.strip():
-                raise ValueError("As instruções de edição são obrigatórias.")
-
-            requested_dimensions = _resolve_target_dimensions(body.width, body.height)
-            aspect_ratio = _normalize_aspect_ratio(body.formato)
-            openai_quality = _normalize_quality(body.qualidade)
-
-            if requested_dimensions:
-                base_width, base_height = _choose_best_supported_base_size(*requested_dimensions)
-                engine_aspect_ratio = _base_size_to_aspect_ratio(base_width, base_height)
-                openai_size = f"{base_width}x{base_height}"
-            else:
-                engine_aspect_ratio = aspect_ratio
-                openai_size = _openai_size_from_aspect_ratio(engine_aspect_ratio)
-
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
                 yield _sse({
                     "status": "Analisando a imagem de referência e refinando o prompt de edição...",
@@ -1744,7 +1763,6 @@ async def image_engine_edit_stream(
 
                 try:
                     if is_multi_replace and is_pure_text_edit:
-                        # Multiple text swaps: detect each region in parallel
                         all_localized_analyses = await analyze_all_regions_with_openai(
                             client=client,
                             image_bytes=image_bytes,
@@ -1753,9 +1771,8 @@ async def image_engine_edit_stream(
                             model=OPENAI_CHAT_MODEL,
                             api_key=openai_key,
                         )
-                        # Use the first valid analysis as the primary for mask/compat
                         localized_analysis = all_localized_analyses[0] if all_localized_analyses else None
-                        localized_mode = False  # multi-replace uses sequential local render, not masked OpenAI
+                        localized_mode = False
                     else:
                         localized_analysis = await analyze_region_with_openai(
                             client=client,
@@ -1772,7 +1789,6 @@ async def image_engine_edit_stream(
                 except Exception as region_exc:
                     localized_warning = f"Falha na detecção localizada. Seguindo com edição conservadora. Detalhe: {str(region_exc)}"
 
-                # For multi-replace, always use local render if we have all analyses
                 all_localizable = (
                     is_multi_replace
                     and is_pure_text_edit
@@ -1821,7 +1837,6 @@ async def image_engine_edit_stream(
 
                 result = None
 
-                # --- Multi-replace: apply all replacements sequentially ---
                 if all_localizable:
                     local_bytes = render_all_local_text_replacements(
                         image_bytes=image_bytes,
@@ -1835,7 +1850,6 @@ async def image_engine_edit_stream(
                             "raw": {"strategy": attempt_plan["reason"], "replacements_count": len(all_localized_analyses)},
                         }
 
-                # --- Single-replace local render ---
                 if result is None and attempt_plan["use_local_render_first"] and localized_analysis:
                     local_bytes = render_local_text_fallback(image_bytes=image_bytes, analysis=localized_analysis)
                     if local_bytes:
@@ -1846,7 +1860,6 @@ async def image_engine_edit_stream(
                             "raw": {"strategy": attempt_plan["reason"]},
                         }
 
-                # --- Fallback: GPT Image 1.5 edit (full image) ---
                 if result is None:
                     final_prompt_for_edit = final_prompt + _build_localized_prompt_appendix(localized_analysis, instruction_info)
                     try:
@@ -1922,7 +1935,7 @@ async def image_engine_edit_stream(
         except Exception as e:
             yield _sse({"error": f"Erro interno no editor: {str(e)}"})
 
-    return StreamingResponse(
+    stream_response = StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
@@ -1931,3 +1944,10 @@ async def image_engine_edit_stream(
             "X-Accel-Buffering": "no",
         },
     )
+    attach_credit_headers(
+        stream_response,
+        current_user,
+        charged_credits=action.credits,
+        action_key=action.key,
+    )
+    return stream_response

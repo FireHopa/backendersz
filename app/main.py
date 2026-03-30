@@ -22,11 +22,19 @@ except ImportError:
 
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 
 from .config import LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET, LINKEDIN_REDIRECT_URI
+from .credits import (
+    CREDIT_ACTION_HEADER,
+    CREDIT_CHARGED_HEADER,
+    CREDIT_HEADER,
+    attach_credit_headers,
+    charge_credits,
+    ensure_credits,
+)
 from .db import init_db, get_session, engine
 from .models import Robot, ChatMessage, CompetitionAnalysis, SkyBobJob, AuthorityEdit, AuthorityAgentRun, BusinessCore, User
 from .schemas import (
@@ -132,6 +140,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        CREDIT_HEADER,
+        CREDIT_CHARGED_HEADER,
+        CREDIT_ACTION_HEADER,
+    ],
 )
 
 
@@ -337,11 +350,20 @@ def delete_robot(public_id: str, session: Session = Depends(get_session), curren
 
 
 @app.post("/api/robots", response_model=RobotOut)
-def create_robot(brief: BriefingIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+def create_robot(
+    brief: BriefingIn,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_credits(current_user, "robot_create")
     try:
         built = build_robot_from_briefing(brief.model_dump())
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    action = charge_credits(session, current_user, "robot_create")
+    attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
 
     robot = Robot(
         user_id=current_user.id,
@@ -442,8 +464,15 @@ def list_messages(public_id: str, session: Session = Depends(get_session), curre
 
 
 @app.post("/api/robots/{public_id}/authority-assistant", response_model=AuthorityAssistantOut)
-def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+def authority_assistant_route(
+    public_id: str,
+    body: AuthorityAssistantIn,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
     robot = _get_robot_or_404(public_id, session, current_user)
+    ensure_credits(current_user, "authority_assistant_edit")
 
     edits = session.exec(
         select(AuthorityEdit)
@@ -515,6 +544,9 @@ def authority_assistant_route(public_id: str, body: AuthorityAssistantIn, sessio
             )
             session.add(edit)
             session.commit()
+
+    action = charge_credits(session, current_user, "authority_assistant_edit")
+    attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
 
     return AuthorityAssistantOut(
         apply_change=bool(result.get("apply_change") or False),
@@ -590,8 +622,15 @@ def update_message(public_id: str, message_id: int, body: MessageUpdateIn, sessi
 
 
 @app.post("/api/robots/{public_id}/audio", response_model=ChatMessageOut)
-async def chat_audio(public_id: str, file: UploadFile = File(...), session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+async def chat_audio(
+    public_id: str,
+    response: Response,
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
     robot = _get_robot_or_404(public_id, session, current_user)
+    ensure_credits(current_user, "robot_audio_message")
     audio_bytes = await file.read()
     try:
         text = transcribe_audio(audio_bytes, filename=file.filename or "audio.webm")
@@ -617,6 +656,11 @@ async def chat_audio(public_id: str, file: UploadFile = File(...), session: Sess
 
     assistant_msg = ChatMessage(robot_id=robot.id, role="assistant", content=answer)
     session.add(assistant_msg)
+
+    action = charge_credits(session, current_user, "robot_audio_message")
+    attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
+
+    session.add(assistant_msg)
     session.commit()
     session.refresh(assistant_msg)
 
@@ -629,8 +673,15 @@ async def chat_audio(public_id: str, file: UploadFile = File(...), session: Sess
 
 
 @app.post("/api/robots/{public_id}/chat", response_model=ChatMessageOut)
-def chat(public_id: str, body: ChatIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+def chat(
+    public_id: str,
+    body: ChatIn,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
     robot = _get_robot_or_404(public_id, session, current_user)
+    ensure_credits(current_user, "robot_chat_message")
     msgs = session.exec(
         select(ChatMessage)
         .where(ChatMessage.robot_id == robot.id)
@@ -656,6 +707,11 @@ def chat(public_id: str, body: ChatIn, session: Session = Depends(get_session), 
         raise HTTPException(status_code=400, detail=str(e))
 
     assistant_msg = ChatMessage(robot_id=robot.id, role="assistant", content=answer)
+    session.add(assistant_msg)
+
+    action = charge_credits(session, current_user, "robot_chat_message")
+    attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
+
     session.add(assistant_msg)
     session.commit()
     session.refresh(assistant_msg)
@@ -826,7 +882,13 @@ def _run_analysis_job(public_id: str):
 
 
 @app.post("/api/competition/find-competitors", response_model=CompetitionFindOut)
-def competition_find_competitors_v2(payload: CompetitionFindRequest, current_user: User = Depends(get_current_user)):
+def competition_find_competitors_v2(
+    payload: CompetitionFindRequest,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_credits(current_user, "competition_find_competitors")
     briefing = payload.briefing.model_dump()
     mapped = {
         "company_name": briefing.get("nome_empresa"),
@@ -837,11 +899,20 @@ def competition_find_competitors_v2(payload: CompetitionFindRequest, current_use
         "offer": briefing.get("servicos"),
     }
     data = find_competitors(mapped)
+    action = charge_credits(session, current_user, "competition_find_competitors")
+    attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
     return data
 
 
 @app.post("/api/competition/analyze", response_model=CompetitionJobV2Out)
-def competition_analyze_v2(payload: CompetitionAnalyzeRequest, bg: BackgroundTasks, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+def competition_analyze_v2(
+    payload: CompetitionAnalyzeRequest,
+    bg: BackgroundTasks,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_credits(current_user, "competition_analyze")
     public_id = str(uuid.uuid4())
     instas = payload.instagrams or []
     sites = payload.sites or []
@@ -862,6 +933,9 @@ def competition_analyze_v2(payload: CompetitionAnalyzeRequest, bg: BackgroundTas
     session.refresh(obj)
 
     bg.add_task(_run_analysis_job, obj.public_id)
+
+    action = charge_credits(session, current_user, "competition_analyze")
+    attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
 
     return CompetitionJobV2Out(
         job_id=obj.public_id,
@@ -987,9 +1061,13 @@ def authority_agents_update_run(run_id: int, payload: dict, session: Session = D
 
 
 @app.post("/api/authority-agents/run", response_model=AuthorityAgentRunOut)
-def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    if current_user.credits < 5:
-        raise HTTPException(status_code=403, detail="Créditos insuficientes. Precisas de 5 créditos para executar o agente de autoridade.")
+def authority_agents_run(
+    payload: AuthorityAgentRunIn,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_credits(current_user, "authority_agent_run")
 
     nucleus = _inject_business_core_knowledge(payload.nucleus, session, current_user)
 
@@ -1000,8 +1078,8 @@ def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depend
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    current_user.credits -= 5
-    session.add(current_user)
+    action = charge_credits(session, current_user, "authority_agent_run")
+    attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
 
     run = AuthorityAgentRun(
         user_id=current_user.id,
@@ -1023,8 +1101,14 @@ def authority_agents_run(payload: AuthorityAgentRunIn, session: Session = Depend
 
 
 @app.post("/api/robots/{public_id}/authority-agents/run", response_model=AuthorityAgentRunOut)
-def authority_agents_run_compat(public_id: str, payload: AuthorityAgentRunIn, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    return authority_agents_run(payload, session, current_user)
+def authority_agents_run_compat(
+    public_id: str,
+    payload: AuthorityAgentRunIn,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    return authority_agents_run(payload, response, session, current_user)
 
 
 @app.get("/api/robots/{public_id}/authority-agents/cooldown")
@@ -1155,17 +1239,20 @@ def delete_business_core_file(public_id: str, filename: str, session: Session = 
 
 
 @app.post("/api/authority-agents/suggest-themes")
-def authority_agents_suggest_themes(payload: SuggestThemesRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    if current_user.credits < 2:
-        raise HTTPException(status_code=403, detail="Créditos insuficientes. Precisas de 2 créditos para gerar temas com IA.")
+def authority_agents_suggest_themes(
+    payload: SuggestThemesRequest,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_credits(current_user, "authority_agent_theme_suggestion")
 
     from .ai import suggest_themes_for_task
     try:
         themes = suggest_themes_for_task(payload.agent_key, payload.nucleus, payload.task)
 
-        current_user.credits -= 2
-        session.add(current_user)
-        session.commit()
+        action = charge_credits(session, current_user, "authority_agent_theme_suggestion")
+        attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
 
         return {"themes": themes}
     except Exception as e:
@@ -1173,11 +1260,20 @@ def authority_agents_suggest_themes(payload: SuggestThemesRequest, session: Sess
 
 
 @app.post("/api/authority-agents/suggest-video-format")
-def authority_agents_suggest_video_format(payload: SuggestVideoFormatRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+def authority_agents_suggest_video_format(
+    payload: SuggestVideoFormatRequest,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_credits(current_user, "authority_agent_video_format_suggestion")
     nucleus = _inject_business_core_knowledge(payload.nucleus or {}, session, current_user)
 
     try:
-        return suggest_video_format_for_theme(payload.agent_key, nucleus, payload.theme)
+        result = suggest_video_format_for_theme(payload.agent_key, nucleus, payload.theme)
+        action = charge_credits(session, current_user, "authority_agent_video_format_suggestion")
+        attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1187,11 +1283,20 @@ def authority_agents_suggest_video_format(payload: SuggestVideoFormatRequest, se
 
 
 @app.post("/api/skybob/preflight")
-def skybob_preflight(payload: SkyBobCatalogRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+def skybob_preflight(
+    payload: SkyBobCatalogRequest,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_credits(current_user, "skybob_preflight")
     nucleus = _inject_business_core_knowledge(payload.nucleus or {}, session, current_user)
 
     try:
-        return generate_skybob_catalog_analysis(nucleus)
+        result = generate_skybob_catalog_analysis(nucleus)
+        action = charge_credits(session, current_user, "skybob_preflight")
+        attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1200,9 +1305,11 @@ def skybob_preflight(payload: SkyBobCatalogRequest, session: Session = Depends(g
 def skybob_start_job(
     payload: SkyBobRunRequest,
     bg: BackgroundTasks,
+    response: Response,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
+    ensure_credits(current_user, "skybob_full_run")
     nucleus = _inject_business_core_knowledge(payload.nucleus or {}, session, current_user)
 
     job = SkyBobJob(
@@ -1220,6 +1327,9 @@ def skybob_start_job(
     session.add(job)
     session.commit()
     session.refresh(job)
+
+    action = charge_credits(session, current_user, "skybob_full_run")
+    attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
 
     bg.add_task(_run_skybob_job, job.public_id)
     return _build_skybob_job_payload(job)
@@ -1259,7 +1369,13 @@ def skybob_get_job_result(job_id: str, session: Session = Depends(get_session), 
 
 
 @app.post("/api/skybob/run")
-def skybob_run(payload: SkyBobRunRequest, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+def skybob_run(
+    payload: SkyBobRunRequest,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_credits(current_user, "skybob_refine_run")
     nucleus = _inject_business_core_knowledge(payload.nucleus or {}, session, current_user)
 
     try:
@@ -1272,6 +1388,9 @@ def skybob_run(payload: SkyBobRunRequest, session: Session = Depends(get_session
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    action = charge_credits(session, current_user, "skybob_refine_run")
+    attach_credit_headers(response, current_user, charged_credits=action.credits, action_key=action.key)
 
     core = _get_business_core(session, current_user, create=True)
     if core:

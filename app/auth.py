@@ -1,15 +1,26 @@
 import httpx
-from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
+from pydantic import BaseModel
 from sqlmodel import Session, select
 
+from .credits import (
+    INITIAL_CREDITS,
+    add_plan_credits,
+    apply_daily_credit_allowance,
+    attach_credit_headers,
+    build_credit_catalog_payload,
+)
 from .db import get_session
-from .models import User
-from .schemas import UserCreate, UserLogin, GoogleAuth, Token
-from .security import get_password_hash, verify_password, create_access_token
 from .deps import get_current_user
+from .models import User
+from .schemas import GoogleAuth, Token, UserCreate, UserLogin
+from .security import create_access_token, get_password_hash, verify_password
 
 router = APIRouter(prefix="/api/auth", tags=["Autenticação"])
+
+
+class CreditPlanActivateIn(BaseModel):
+    plan_id: str
 
 
 def _token_payload(user: User, access_token: str) -> dict:
@@ -38,14 +49,7 @@ def _token_payload(user: User, access_token: str) -> dict:
 
 
 def check_and_reset_credits(user: User, session: Session) -> User:
-    now = datetime.now(timezone.utc)
-    if user.last_credit_reset.date() < now.date():
-        user.credits = 100
-        user.last_credit_reset = now
-        session.add(user)
-        session.commit()
-        session.refresh(user)
-    return user
+    return apply_daily_credit_allowance(user, session)
 
 
 @router.post("/register", response_model=Token)
@@ -58,7 +62,7 @@ def register(user_in: UserCreate, session: Session = Depends(get_session)):
         email=user_in.email,
         hashed_password=get_password_hash(user_in.password),
         full_name=user_in.full_name,
-        credits=100,
+        credits=INITIAL_CREDITS,
     )
     session.add(new_user)
     session.commit()
@@ -103,7 +107,7 @@ def google_auth(auth_in: GoogleAuth, session: Session = Depends(get_session)):
 
         user = session.exec(select(User).where(User.email == email)).first()
         if not user:
-            user = User(email=email, full_name=name, google_id=google_id, credits=100)
+            user = User(email=email, full_name=name, google_id=google_id, credits=INITIAL_CREDITS)
             session.add(user)
             session.commit()
             session.refresh(user)
@@ -112,8 +116,9 @@ def google_auth(auth_in: GoogleAuth, session: Session = Depends(get_session)):
                 user.google_id = google_id
                 session.add(user)
                 session.commit()
-            user = check_and_reset_credits(user, session)
+                session.refresh(user)
 
+        user = check_and_reset_credits(user, session)
         access_token = create_access_token(data={"sub": user.email})
         return _token_payload(user, access_token)
 
@@ -124,8 +129,13 @@ def google_auth(auth_in: GoogleAuth, session: Session = Depends(get_session)):
 
 
 @router.get("/me")
-def get_me(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+def get_me(
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
     current_user = check_and_reset_credits(current_user, session)
+    attach_credit_headers(response, current_user)
     return {
         "email": current_user.email,
         "full_name": current_user.full_name,
@@ -146,4 +156,39 @@ def get_me(current_user: User = Depends(get_current_user), session: Session = De
         "has_google_business_profile": bool(current_user.google_business_refresh_token),
         "google_business_account_display_name": current_user.google_business_account_display_name,
         "google_business_location_title": current_user.google_business_location_title,
+    }
+
+
+@router.get("/credits/catalog")
+def get_credits_catalog(
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    attach_credit_headers(response, current_user)
+    return build_credit_catalog_payload(current_user)
+
+
+@router.post("/credits/activate-plan")
+def activate_credit_plan(
+    payload: CreditPlanActivateIn,
+    response: Response,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        plan, current_credits = add_plan_credits(session, current_user, payload.plan_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Plano de créditos não encontrado.")
+
+    attach_credit_headers(response, current_user, charged_credits=0, action_key=f"credit_plan:{plan.id}")
+
+    return {
+        "ok": True,
+        "plan_id": plan.id,
+        "title": plan.title,
+        "display_price": plan.display_price,
+        "credits_added": plan.total_credits,
+        "base_credits": plan.base_credits,
+        "bonus_credits": plan.bonus_credits,
+        "credits": current_credits,
     }

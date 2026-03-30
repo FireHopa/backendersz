@@ -21,7 +21,7 @@ class Token(BaseModel):
     token_type: str = "bearer"
     user_name: Optional[str] = None
     user_email: str
-    credits: int = 100
+    credits: int = 12_000
     has_linkedin: bool = False
     has_instagram: bool = False
     instagram_username: Optional[str] = None

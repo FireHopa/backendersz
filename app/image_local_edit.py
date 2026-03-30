@@ -15,10 +15,10 @@ from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont, ImageStat
 
 # --- CONFIGURAÇÃO DE LOGGING ROBUSTO ---
 logger = logging.getLogger("image_local_edit")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 if not logger.handlers:
     ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
+    ch.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - [%(levelname)s] - %(name)s: %(message)s')
     ch.setFormatter(formatter)
     logger.addHandler(ch)
@@ -163,36 +163,88 @@ def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageF
     return ImageFont.load_default()
 
 
+
+
+def _clean_replacement_token(value: str) -> str:
+    token = (value or "").strip()
+    if not token:
+        return ""
+
+    token = token.strip(" \t\r\n\u2018\u2019\u201c\u201d'\".,;:")
+    if token.startswith("(") and token.endswith(")") and len(token) >= 2:
+        inner = token[1:-1].strip()
+        if inner:
+            token = inner.strip(" \t\r\n\u2018\u2019\u201c\u201d'\".,;:")
+    return token.strip()
+
+
+def _extract_all_text_replacements(instruction: str) -> List[Dict[str, str]]:
+    """Extract ALL text replacement pairs from a multi-replacement instruction."""
+    text = (instruction or "").strip()
+    if not text:
+        return []
+
+    segments = re.split(
+        r"[;,]\s*|\s+e\s+(?=(?:troque|substitua|mude|altere|corrija|edite|atualize)\b)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    segments = [s.strip() for s in segments if s.strip()]
+
+    patterns = [
+        r'troqu[eia]?\s+\(?\s*[\"“”\'](?P<old>.+?)[\"“”\']\s*\)?\s+por\s+\(?\s*[\"“”\'](?P<new>.+?)[\"“”\']\s*\)?',
+        r'substitu[a-z]*\s+\(?\s*[\"“”\'](?P<old>.+?)[\"“”\']\s*\)?\s+por\s+\(?\s*[\"“”\'](?P<new>.+?)[\"“”\']\s*\)?',
+        r'alter[eia]?\s+\(?\s*[\"“”\'](?P<old>.+?)[\"“”\']\s*\)?\s+para\s+\(?\s*[\"“”\'](?P<new>.+?)[\"“”\']\s*\)?',
+        r'mud[eia]?\s+\(?\s*[\"“”\'](?P<old>.+?)[\"“”\']\s*\)?\s+para\s+\(?\s*[\"“”\'](?P<new>.+?)[\"“”\']\s*\)?',
+        r'troqu[eia]?\s+\(\s*(?P<old>.+?)\s*\)\s+por\s+\(\s*(?P<new>.+?)\s*\)',
+        r'substitu[a-z]*\s+\(\s*(?P<old>.+?)\s*\)\s+por\s+\(\s*(?P<new>.+?)\s*\)',
+        r'alter[eia]?\s+\(\s*(?P<old>.+?)\s*\)\s+para\s+\(\s*(?P<new>.+?)\s*\)',
+        r'mud[eia]?\s+\(\s*(?P<old>.+?)\s*\)\s+para\s+\(\s*(?P<new>.+?)\s*\)',
+        r"troqu[eia]?\s+(?P<old>[^\n,]+?)\s+por\s+(?P<new>[^\n,]+)",
+        r"substitu[a-z]*\s+(?P<old>[^\n,]+?)\s+por\s+(?P<new>[^\n,]+)",
+        r"alter[eia]?\s+(?P<old>[^\n,]+?)\s+para\s+(?P<new>[^\n,]+)",
+        r"mud[eia]?\s+(?P<old>[^\n,]+?)\s+para\s+(?P<new>[^\n,]+)",
+    ]
+
+    results: List[Dict[str, str]] = []
+    seen_old: set = set()
+
+    for segment in segments:
+        for pattern in patterns:
+            match = re.search(pattern, segment, flags=re.IGNORECASE)
+            if match:
+                old = _clean_replacement_token(match.group("old") or "")
+                new = _clean_replacement_token(match.group("new") or "")
+                if old and new and old.lower() != new.lower() and old.lower() not in seen_old:
+                    seen_old.add(old.lower())
+                    results.append({"old_text": old, "new_text": new})
+                break
+
+    return results
+
+
 def _extract_text_replacement(instruction: str) -> Optional[Dict[str, str]]:
     text = (instruction or "").strip()
     if not text:
         return None
 
-    patterns = [
-        r"troqu[eia]?\s+[\"“”'](?P<old>.+?)[\"“”']\s+por\s+[\"“”'](?P<new>.+?)[\"“”']",
-        r"substitu[a-z]*\s+[\"“”'](?P<old>.+?)[\"“”']\s+por\s+[\"“”'](?P<new>.+?)[\"“”']",
-        r"alter[eia]?\s+[\"“”'](?P<old>.+?)[\"“”']\s+para\s+[\"“”'](?P<new>.+?)[\"“”']",
-        r"mud[eia]?\s+[\"“”'](?P<old>.+?)[\"“”']\s+para\s+[\"“”'](?P<new>.+?)[\"“”']",
-        r"troqu[eia]?\s+(?P<old>[^\n]+?)\s+por\s+(?P<new>[^\n]+)",
-        r"substitu[a-z]*\s+(?P<old>[^\n]+?)\s+por\s+(?P<new>[^\n]+)",
-        r"alter[eia]?\s+(?P<old>[^\n]+?)\s+para\s+(?P<new>[^\n]+)",
-        r"mud[eia]?\s+(?P<old>[^\n]+?)\s+para\s+(?P<new>[^\n]+)",
-    ]
+    items = _extract_all_text_replacements(text)
+    if not items:
+        return None
 
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            old = (match.group("old") or "").strip(" '‘’\"“”.,;:")
-            new = (match.group("new") or "").strip(" '‘’\"“”.,;:")
-            if old and new and old.lower() != new.lower():
-                return {"old_text": old, "new_text": new}
+    first = items[0]
+    old = _clean_replacement_token(first.get("old_text") or "")
+    new = _clean_replacement_token(first.get("new_text") or "")
+    if old and new and old.lower() != new.lower():
+        return {"old_text": old, "new_text": new}
     return None
 
 
 def extract_edit_instruction_info(text: str) -> Dict[str, Any]:
     raw = (text or "").strip()
     lowered = raw.lower()
-    replacement = _extract_text_replacement(raw)
+    all_replacements = _extract_all_text_replacements(raw)
+    replacement = all_replacements[0] if all_replacements else None
 
     pure_text_positive_patterns = [
         r"\b(troque|substitua|mude|altere|corrija|edite|atualize)\b.*\b(texto|frase|headline|subheadline|bot[aã]o|cta|data|cidade|local)\b",
@@ -208,7 +260,7 @@ def extract_edit_instruction_info(text: str) -> Dict[str, Any]:
     positive_match = any(re.search(pattern, raw, flags=re.IGNORECASE) for pattern in pure_text_positive_patterns)
 
     edit_type = "generic_edit"
-    if replacement and (positive_match or not mentions_broad_visual):
+    if all_replacements and (positive_match or not mentions_broad_visual):
         edit_type = "text_replace"
 
     target_hint = None
@@ -219,12 +271,17 @@ def extract_edit_instruction_info(text: str) -> Dict[str, Any]:
         if hint_match:
             target_hint = hint_match.group(1)
 
+    is_pure_text_edit = bool(edit_type == "text_replace" and all_replacements)
+    is_multi_replace = len(all_replacements) > 1
+
     return {
         "raw_instruction": raw,
         "edit_type": edit_type,
         "replacement": replacement,
+        "all_replacements": all_replacements,
         "target_hint": target_hint,
-        "is_pure_text_edit": bool(edit_type == "text_replace" and replacement),
+        "is_pure_text_edit": is_pure_text_edit,
+        "is_multi_replace": is_multi_replace,
         "mentions_broad_visual_changes": mentions_broad_visual,
     }
 
@@ -537,7 +594,7 @@ async def _ask_openai_for_json(
         "messages": messages,
         "temperature": 0.0,
     }
-    resp = await client.post("[https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions)", headers=headers, json=payload)
+    resp = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
     return _parse_json_safe(content)
@@ -693,23 +750,76 @@ def should_use_localized_edit(analysis: Optional[Dict[str, Any]]) -> bool:
     return False
 
 
+
 def should_use_local_text_render(
     analysis: Optional[Dict[str, Any]],
     instruction_info: Optional[Dict[str, Any]] = None,
 ) -> bool:
+    """
+    O render local só é seguro em casos MUITO restritos.
+    Para títulos, headlines, cidades, datas e textos livres, preferimos mask + OpenAI edit.
+    """
     if not analysis:
         return False
+
     instruction_info = instruction_info or {}
     if not instruction_info.get("is_pure_text_edit"):
         return False
+
     confidence = float(analysis.get("confidence", 0.0) or 0.0)
     operation = (analysis.get("operation") or "").lower()
-    text_bbox = analysis.get("text_bbox") or analysis.get("bbox")
-    if operation not in {"text_replace", "button_text_replace"}:
+    text_bbox_norm = analysis.get("text_bbox") or analysis.get("bbox")
+    container_bbox_norm = analysis.get("container_bbox")
+    replacement_text = (analysis.get("replacement_text") or "").strip()
+    target_text = (analysis.get("target_text") or "").strip()
+    style = analysis.get("style") or {}
+
+    if operation != "button_text_replace":
+        logger.debug("Local render desativado: operação não é button_text_replace.")
         return False
-    if not text_bbox:
+
+    if not text_bbox_norm or not container_bbox_norm:
+        logger.debug("Local render desativado: faltam caixas text_bbox/container_bbox.")
         return False
-    return confidence >= 0.58
+
+    if confidence < 0.82:
+        logger.debug("Local render desativado: confiança %.3f abaixo do mínimo seguro.", confidence)
+        return False
+
+    try:
+        box_w = float(text_bbox_norm.get("w", 0.0) or 0.0)
+        box_h = float(text_bbox_norm.get("h", 0.0) or 0.0)
+        aspect = box_w / max(box_h, 1e-6)
+    except Exception:
+        logger.debug("Local render desativado: caixa inválida.")
+        return False
+
+    if aspect < 2.8:
+        logger.debug("Local render desativado: caixa de texto estreita demais (aspect=%.3f).", aspect)
+        return False
+
+    if len(replacement_text) > 26:
+        logger.debug("Local render desativado: replacement_text longo demais (%s chars).", len(replacement_text))
+        return False
+
+    if "\n" in replacement_text:
+        logger.debug("Local render desativado: replacement_text multilinha.")
+        return False
+
+    if target_text:
+        old_len = max(1, len(target_text))
+        new_len = len(replacement_text)
+        ratio = new_len / float(old_len)
+        if ratio < 0.60 or ratio > 1.35:
+            logger.debug("Local render desativado: delta de comprimento inseguro (ratio=%.3f).", ratio)
+            return False
+
+    if style.get("glow"):
+        logger.debug("Local render desativado: texto com glow detectado.")
+        return False
+
+    logger.debug("Local render ativado com critérios estritos.")
+    return True
 
 
 def build_mask_from_analysis(
@@ -952,3 +1062,54 @@ def render_local_text_fallback(
     except Exception as e:
         logger.error(f"Erro CRÍTICO na função base render_local_text_fallback: {e}", exc_info=True)
         raise
+
+async def analyze_all_regions_with_openai(
+    client: httpx.AsyncClient,
+    image_bytes: bytes,
+    content_type: str,
+    instruction_info: Dict[str, Any],
+    model: str,
+    api_key: str,
+) -> List[Dict[str, Any]]:
+    """Analyze all text replacement regions in parallel, one per replacement."""
+    import asyncio
+    all_replacements = instruction_info.get("all_replacements") or []
+    if not all_replacements:
+        return []
+
+    async def _analyze_one(rep: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        synthetic_instruction = f'Troque "{rep["old_text"]}" por "{rep["new_text"]}"'
+        try:
+            return await analyze_region_with_openai(
+                client=client,
+                image_bytes=image_bytes,
+                content_type=content_type,
+                instruction=synthetic_instruction,
+                model=model,
+                api_key=api_key,
+            )
+        except Exception as exc:
+            logger.warning(f"Falha ao analisar região para '{rep['old_text']}': {exc}")
+            return None
+
+    results = await asyncio.gather(*[_analyze_one(rep) for rep in all_replacements])
+    return [r for r in results if r is not None]
+
+
+def render_all_local_text_replacements(
+    image_bytes: bytes,
+    analyses: List[Dict[str, Any]],
+) -> Optional[bytes]:
+    """Apply multiple local text replacements sequentially to the same image."""
+    if not analyses:
+        return None
+    current_bytes = image_bytes
+    for idx, analysis in enumerate(analyses):
+        logger.info(f"Aplicando substituição local {idx + 1}/{len(analyses)}: '{analysis.get('target_text', '?')}' → '{analysis.get('replacement_text', '?')}'")
+        result = render_local_text_fallback(current_bytes, analysis)
+        if result is None:
+            logger.warning(f"Substituição {idx + 1} falhou (render_local_text_fallback retornou None). Abortando.")
+            return None
+        current_bytes = result
+    logger.info(f"Todas as {len(analyses)} substituições locais aplicadas com sucesso.")
+    return current_bytes

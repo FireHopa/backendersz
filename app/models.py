@@ -128,6 +128,23 @@ class BusinessCore(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
+
+class ImageEngineProject(SQLModel, table=True):
+    __tablename__ = "image_engine_project"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    public_id: str = Field(index=True, unique=True)
+
+    name: str = Field(default="Projeto")
+    position: int = Field(default=0, index=True)
+    snapshot_json: str = Field(default="{}")
+    is_current: bool = Field(default=False, index=True)
+
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow, index=True)
+
+
 class ChatMessage(SQLModel, table=True):
     __tablename__ = "chat_message"
 
@@ -153,6 +170,30 @@ class CompetitionAnalysis(SQLModel, table=True):
 
     result_json: str | None = Field(default=None)
     error: str | None = Field(default=None)
+
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class SkyBobJob(SQLModel, table=True):
+    __tablename__ = "skybob_job"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    public_id: str = Field(index=True, unique=True)
+
+    mode: str = Field(default="full", index=True)
+    nucleus_json: str = Field(default="{}")
+    preferences_json: str = Field(default="{}")
+    previous_study_json: str = Field(default="{}")
+    catalog_analysis_json: str = Field(default="{}")
+
+    status: str = Field(default="queued", index=True)
+    stage: str = Field(default="Na fila")
+    progress: float = Field(default=0.0)
+
+    result_json: Optional[str] = Field(default=None)
+    error: Optional[str] = Field(default=None)
 
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)

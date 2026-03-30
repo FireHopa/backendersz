@@ -27,8 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 
 from .config import LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET, LINKEDIN_REDIRECT_URI
-from .db import init_db, get_session
-from .models import Robot, ChatMessage, CompetitionAnalysis, AuthorityEdit, AuthorityAgentRun, BusinessCore, User
+from .db import init_db, get_session, engine
+from .models import Robot, ChatMessage, CompetitionAnalysis, SkyBobJob, AuthorityEdit, AuthorityAgentRun, BusinessCore, User
 from .schemas import (
     BriefingIn,
     RobotOut,
@@ -657,6 +657,111 @@ def _update_analysis(session, obj, **kwargs):
     session.refresh(obj)
 
 
+def _build_skybob_job_payload(job: SkyBobJob) -> dict:
+    return {
+        "job_id": job.public_id,
+        "status": job.status,
+        "stage": job.stage,
+        "progress": job.progress,
+        "mode": job.mode,
+        "error": job.error,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+    }
+
+
+def _update_skybob_job(session: Session, job: SkyBobJob, **kwargs) -> SkyBobJob:
+    for key, value in kwargs.items():
+        setattr(job, key, value)
+    job.updated_at = datetime.utcnow()
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    return job
+
+
+def _run_skybob_job(public_id: str):
+    with Session(engine) as session:
+        job = None
+        try:
+            job = session.exec(select(SkyBobJob).where(SkyBobJob.public_id == public_id)).first()
+            if not job:
+                return
+
+            user = session.get(User, job.user_id) if job.user_id else None
+            if not user:
+                _update_skybob_job(
+                    session,
+                    job,
+                    status="error",
+                    stage="Usuário da missão não encontrado",
+                    progress=1.0,
+                    error="Usuário responsável pela missão não encontrado.",
+                )
+                return
+
+            nucleus = json.loads(job.nucleus_json or "{}")
+            preferences = json.loads(job.preferences_json or "{}")
+            previous_study = json.loads(job.previous_study_json or "{}")
+            catalog_analysis = json.loads(job.catalog_analysis_json or "{}") or None
+
+            _update_skybob_job(session, job, status="running", stage="Lendo o núcleo da empresa", progress=0.12)
+
+            if not catalog_analysis:
+                _update_skybob_job(session, job, stage="Mapeando serviços e sinais do nicho", progress=0.34)
+                catalog_analysis = generate_skybob_catalog_analysis(nucleus)
+                _update_skybob_job(
+                    session,
+                    job,
+                    stage="Catálogo interpretado e pronto para a IA",
+                    progress=0.56,
+                    catalog_analysis_json=json.dumps(catalog_analysis, ensure_ascii=False),
+                )
+            else:
+                _update_skybob_job(session, job, stage="Usando catálogo já validado", progress=0.48)
+
+            _update_skybob_job(session, job, stage="IA montando estudo e Hook Lab", progress=0.78)
+            study = generate_skybob_study(
+                nucleus,
+                preferences=preferences or {},
+                previous_study=previous_study or {},
+                catalog_analysis=catalog_analysis,
+                mode=job.mode or "full",
+            )
+
+            result_payload = dict(study or {})
+            if catalog_analysis and not result_payload.get("catalog_analysis"):
+                result_payload["catalog_analysis"] = catalog_analysis
+
+            core = _get_business_core(session, user, create=True)
+            if core:
+                core.skybob = result_payload.get("serialized_text") or ""
+                core.updated_at = datetime.utcnow()
+                session.add(core)
+                session.commit()
+
+            _update_skybob_job(session, job, stage="Salvando resultado da missão", progress=0.94)
+            _update_skybob_job(
+                session,
+                job,
+                status="done",
+                stage="Concluído",
+                progress=1.0,
+                result_json=json.dumps(result_payload, ensure_ascii=False),
+            )
+        except Exception as e:
+            if job:
+                _update_skybob_job(
+                    session,
+                    job,
+                    status="error",
+                    stage="Erro no processamento",
+                    progress=1.0,
+                    error=str(e),
+                )
+
+
+
 def _domain(url: str) -> str:
     from urllib.parse import urlparse
     try:
@@ -1069,6 +1174,68 @@ def skybob_preflight(payload: SkyBobCatalogRequest, session: Session = Depends(g
         return generate_skybob_catalog_analysis(nucleus)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/skybob/jobs")
+def skybob_start_job(
+    payload: SkyBobRunRequest,
+    bg: BackgroundTasks,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    nucleus = _inject_business_core_knowledge(payload.nucleus or {}, session, current_user)
+
+    job = SkyBobJob(
+        user_id=current_user.id,
+        public_id=uuid.uuid4().hex,
+        mode=payload.mode or "full",
+        nucleus_json=json.dumps(nucleus, ensure_ascii=False),
+        preferences_json=json.dumps(payload.preferences or {}, ensure_ascii=False),
+        previous_study_json=json.dumps(payload.previous_study or {}, ensure_ascii=False),
+        catalog_analysis_json=json.dumps(payload.catalog_analysis or {}, ensure_ascii=False),
+        status="queued",
+        stage="Missão na fila",
+        progress=0.04,
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+
+    bg.add_task(_run_skybob_job, job.public_id)
+    return _build_skybob_job_payload(job)
+
+
+@app.get("/api/skybob/jobs/{job_id}")
+def skybob_get_job(job_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    job = session.exec(
+        select(SkyBobJob).where(SkyBobJob.public_id == job_id, SkyBobJob.user_id == current_user.id)
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Missão do SkyBob não encontrada.")
+    return _build_skybob_job_payload(job)
+
+
+@app.get("/api/skybob/jobs/{job_id}/result")
+def skybob_get_job_result(job_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    job = session.exec(
+        select(SkyBobJob).where(SkyBobJob.public_id == job_id, SkyBobJob.user_id == current_user.id)
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Missão do SkyBob não encontrada.")
+    if job.status == "error":
+        raise HTTPException(status_code=400, detail=job.error or "A missão do SkyBob terminou com erro.")
+    if job.status != "done":
+        raise HTTPException(status_code=409, detail="A missão do SkyBob ainda não terminou.")
+
+    try:
+        result = json.loads(job.result_json or "{}")
+    except Exception:
+        result = {}
+
+    return {
+        **_build_skybob_job_payload(job),
+        "result": result,
+    }
 
 
 @app.post("/api/skybob/run")

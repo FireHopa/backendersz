@@ -18,6 +18,31 @@ router = APIRouter(prefix="/api/bobar", tags=["Bobar"])
 DEFAULT_COLUMNS = ("Entrada", "Em produção", "Finalizados")
 CARD_TYPES = {"manual", "roteiro", "conteudo", "ideia", "checklist", "fluxograma"}
 
+
+AUTHORITY_IMPORT_SOURCE_PREFIXES = (
+    "authority_agent_import:",
+    "authority_agent:",
+)
+AUTHORITY_WORKSPACE_SOURCE_PREFIX = "authority_agent_workspace:"
+
+IMPORTED_ROLE_SPECS = (
+    {
+        "key": "base_estrategica",
+        "name": "Base estratégica",
+        "titles": ("Análise do tema", "Estratégia do vídeo", "Formato do vídeo"),
+    },
+    {
+        "key": "gancho_execucao",
+        "name": "Gancho e execução",
+        "titles": ("Hooks", "Roteiro segundo a segundo", "Variações"),
+    },
+    {
+        "key": "apoio_publicacao",
+        "name": "Apoio de publicação",
+        "titles": ("Texto na tela", "Legenda"),
+    },
+)
+
 TIME_RANGE_RE = re.compile(r"(?i)\b(\d+\s*(?:-|a|até|to)\s*\d+\s*s)\b")
 TIME_SINGLE_RE = re.compile(r"(?i)\b(\d+\s*s)\b")
 
@@ -85,6 +110,317 @@ class BobarCardMoveIn(BaseModel):
 
 def _clean_text(value: Optional[str]) -> str:
     return str(value or "").strip()
+
+
+def _normalize_signature_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def _canonical_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _canonical_json(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_canonical_json(item) for item in value]
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _is_authority_import_source_kind(source_kind: Optional[str]) -> bool:
+    normalized = _clean_text(source_kind).lower()
+    if normalized in {"authority_agent_import", "authority_agent"}:
+        return True
+    return any(normalized.startswith(prefix) for prefix in AUTHORITY_IMPORT_SOURCE_PREFIXES)
+
+
+def _authority_workspace_source_kind(import_card_id: int) -> str:
+    return f"{AUTHORITY_WORKSPACE_SOURCE_PREFIX}{int(import_card_id or 0)}"
+
+
+def _extract_import_workspace_meta(structure_json: str) -> dict[str, Any]:
+    parsed = _parse_json(structure_json or "")
+    if not isinstance(parsed, dict):
+        return {}
+
+    payload = parsed.get("import_workspace")
+    if not isinstance(payload, dict):
+        return {}
+
+    return payload
+
+
+def _write_import_workspace_meta(
+    structure_json: str,
+    *,
+    title: str,
+    column_ids: list[int],
+    created_at: Optional[str] = None,
+) -> str:
+    parsed = _parse_json(structure_json or "")
+    root = parsed if isinstance(parsed, dict) else {}
+    root["import_workspace"] = {
+        "version": 1,
+        "title": _clean_text(title) or "Roteiro importado",
+        "column_ids": [int(item) for item in column_ids if int(item) > 0],
+        "created_at": _clean_text(created_at) or utcnow().isoformat(),
+    }
+    return _json_dumps(root)
+
+
+def _flowchart_semantic_signature(structure_json: str, fallback_title: str, fallback_content: str) -> dict[str, Any]:
+    normalized = _normalize_flowchart_structure(structure_json or "{}", fallback_title, fallback_content)
+    nodes = normalized.get("nodes") if isinstance(normalized, dict) else []
+    semantic_nodes: list[dict[str, str]] = []
+
+    if isinstance(nodes, list):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            semantic_nodes.append(
+                {
+                    "title": _clean_text(node.get("title")),
+                    "content": _clean_text(node.get("content")),
+                    "time": _clean_text(node.get("time")),
+                    "kind": _clean_text(node.get("kind")),
+                }
+            )
+
+    edges = normalized.get("edges") if isinstance(normalized, dict) else []
+    return {
+        "nodes": semantic_nodes,
+        "edge_count": len(edges) if isinstance(edges, list) else 0,
+    }
+
+
+def _card_semantic_signature(card: BobarCard) -> str:
+    payload: dict[str, Any] = {
+        "title": _clean_text(card.title),
+        "card_type": _clean_text(card.card_type).lower(),
+        "content_text": _clean_text(card.content_text),
+        "note": _clean_text(card.note),
+    }
+
+    if _clean_text(card.card_type).lower() == "fluxograma":
+        payload["flow"] = _flowchart_semantic_signature(card.structure_json, card.title, card.content_text)
+    else:
+        structure = _parse_json(card.structure_json or "")
+        payload["structure"] = _canonical_json(structure) if structure is not None else {}
+
+    return _json_dumps(payload)
+
+
+def _column_semantic_signature(column: BobarColumn, cards: list[BobarCard]) -> str:
+    ordered_cards = sorted(cards, key=lambda item: (item.position, item.id or 0))
+    payload = {
+        "name": _clean_text(column.name),
+        "cards": [_card_semantic_signature(card) for card in ordered_cards],
+    }
+    return _json_dumps(payload)
+
+
+def _match_imported_role(column: BobarColumn, cards: list[BobarCard]) -> Optional[str]:
+    normalized_name = _normalize_signature_text(column.name)
+    title_set = {_normalize_signature_text(card.title) for card in cards if _clean_text(card.title)}
+
+    for spec in IMPORTED_ROLE_SPECS:
+        expected_name = _normalize_signature_text(spec["name"])
+        expected_titles = {_normalize_signature_text(title) for title in spec["titles"]}
+        if normalized_name == expected_name and title_set == expected_titles:
+            return str(spec["key"])
+
+    return None
+
+
+def _column_rank_key(column: BobarColumn, cards: list[BobarCard], referenced_column_ids: set[int]) -> tuple[int, Any, int, int, int]:
+    latest_update = max([column.updated_at, *[card.updated_at for card in cards]])
+    return (
+        1 if (column.id or 0) in referenced_column_ids else 0,
+        latest_update,
+        len(cards),
+        -(column.position or 0),
+        -(column.id or 0),
+    )
+
+
+def _card_rank_key(card: BobarCard) -> tuple[int, Any, int]:
+    return (
+        -(card.position or 0),
+        card.updated_at,
+        -(card.id or 0),
+    )
+
+
+def _cleanup_duplicate_workspace_for_import(session: Session, current_user: User, import_card: BobarCard) -> BobarBoardOut:
+    import_card_id = import_card.id or 0
+    if import_card_id <= 0:
+        return _build_board(session, current_user)
+
+    workspace_source_kind = _authority_workspace_source_kind(import_card_id)
+    workspace_cards = session.exec(
+        select(BobarCard)
+        .where(BobarCard.user_id == current_user.id, BobarCard.source_kind == workspace_source_kind)
+        .order_by(BobarCard.column_id.asc(), BobarCard.position.asc(), BobarCard.id.asc())
+    ).all()
+
+    if not workspace_cards:
+        meta = _extract_import_workspace_meta(import_card.structure_json)
+        next_structure_json = _write_import_workspace_meta(
+            import_card.structure_json,
+            title=_clean_text(meta.get("title")) or import_card.title,
+            column_ids=[],
+            created_at=_clean_text(meta.get("created_at")),
+        )
+        if next_structure_json != import_card.structure_json:
+            import_card.structure_json = next_structure_json
+            import_card.updated_at = utcnow()
+            session.add(import_card)
+            session.commit()
+        return _build_board(session, current_user)
+
+    column_ids = sorted({card.column_id for card in workspace_cards if card.column_id})
+    workspace_columns = session.exec(
+        select(BobarColumn)
+        .where(BobarColumn.user_id == current_user.id, BobarColumn.id.in_(column_ids))
+        .order_by(BobarColumn.position.asc(), BobarColumn.id.asc())
+    ).all()
+
+    cards_by_column: dict[int, list[BobarCard]] = {column_id: [] for column_id in column_ids}
+    for card in workspace_cards:
+        cards_by_column.setdefault(card.column_id, []).append(card)
+
+    meta = _extract_import_workspace_meta(import_card.structure_json)
+    referenced_column_ids = {
+        int(item)
+        for item in meta.get("column_ids", [])
+        if isinstance(item, (int, float, str)) and str(item).isdigit() and int(item) > 0
+    }
+
+    candidates = [
+        {
+            "column": column,
+            "cards": cards_by_column.get(column.id or 0, []),
+            "signature": _column_semantic_signature(column, cards_by_column.get(column.id or 0, [])),
+            "role_key": _match_imported_role(column, cards_by_column.get(column.id or 0, [])),
+        }
+        for column in workspace_columns
+    ]
+
+    column_ids_to_delete: set[int] = set()
+
+    signature_groups: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        signature_groups.setdefault(candidate["signature"], []).append(candidate)
+
+    for group in signature_groups.values():
+        if len(group) <= 1:
+            continue
+        keeper = max(
+            group,
+            key=lambda item: _column_rank_key(
+                item["column"],
+                item["cards"],
+                referenced_column_ids,
+            ),
+        )
+        keeper_id = keeper["column"].id or 0
+        for item in group:
+            column_id = item["column"].id or 0
+            if column_id != keeper_id:
+                column_ids_to_delete.add(column_id)
+
+    role_groups: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        column_id = candidate["column"].id or 0
+        role_key = candidate["role_key"]
+        if not role_key or column_id in column_ids_to_delete:
+            continue
+        role_groups.setdefault(role_key, []).append(candidate)
+
+    for group in role_groups.values():
+        if len(group) <= 1:
+            continue
+        keeper = max(
+            group,
+            key=lambda item: _column_rank_key(
+                item["column"],
+                item["cards"],
+                referenced_column_ids,
+            ),
+        )
+        keeper_id = keeper["column"].id or 0
+        for item in group:
+            column_id = item["column"].id or 0
+            if column_id != keeper_id:
+                column_ids_to_delete.add(column_id)
+
+    card_ids_to_delete: set[int] = set()
+    affected_column_ids: set[int] = set()
+
+    for candidate in candidates:
+        column = candidate["column"]
+        column_id = column.id or 0
+        if column_id in column_ids_to_delete:
+            continue
+
+        signature_groups_for_cards: dict[str, list[BobarCard]] = {}
+        for card in candidate["cards"]:
+            signature_groups_for_cards.setdefault(_card_semantic_signature(card), []).append(card)
+
+        for group in signature_groups_for_cards.values():
+            if len(group) <= 1:
+                continue
+            keeper = max(group, key=_card_rank_key)
+            keeper_id = keeper.id or 0
+            for card in group:
+                card_id = card.id or 0
+                if card_id and card_id != keeper_id:
+                    card_ids_to_delete.add(card_id)
+                    affected_column_ids.add(column_id)
+
+    if card_ids_to_delete:
+        duplicate_cards = session.exec(
+            select(BobarCard)
+            .where(BobarCard.user_id == current_user.id, BobarCard.id.in_(sorted(card_ids_to_delete)))
+        ).all()
+        for card in duplicate_cards:
+            session.delete(card)
+
+    if column_ids_to_delete:
+        duplicate_columns = session.exec(
+            select(BobarColumn)
+            .where(BobarColumn.user_id == current_user.id, BobarColumn.id.in_(sorted(column_ids_to_delete)))
+        ).all()
+        for column in duplicate_columns:
+            session.delete(column)
+
+    surviving_columns = [
+        candidate["column"]
+        for candidate in candidates
+        if (candidate["column"].id or 0) not in column_ids_to_delete
+    ]
+    surviving_column_ids = [column.id or 0 for column in surviving_columns if (column.id or 0) > 0]
+
+    next_structure_json = _write_import_workspace_meta(
+        import_card.structure_json,
+        title=_clean_text(meta.get("title")) or import_card.title,
+        column_ids=surviving_column_ids,
+        created_at=_clean_text(meta.get("created_at")),
+    )
+
+    changed = bool(card_ids_to_delete or column_ids_to_delete or next_structure_json != import_card.structure_json)
+
+    if next_structure_json != import_card.structure_json:
+        import_card.structure_json = next_structure_json
+        import_card.updated_at = utcnow()
+        session.add(import_card)
+
+    if changed:
+        session.commit()
+        for column_id in sorted(affected_column_ids.union(surviving_column_ids)):
+            _reindex_cards_for_column(session, current_user, column_id)
+        _reindex_columns(session, current_user)
+
+    return _build_board(session, current_user)
 
 
 def _clip(value: str, limit: int) -> str:
@@ -422,11 +758,15 @@ def _normalize_flowchart_structure(raw_structure: Any, title: str, content_text:
 
 
 def _resolve_structure_json(card_type: str, provided_structure_json: Optional[str], title: str, content_text: str) -> str:
-    if card_type != "fluxograma" and not _clean_text(provided_structure_json):
+    if (card_type or "").lower() == "fluxograma":
+        normalized = _normalize_flowchart_structure(provided_structure_json or "{}", title, content_text)
+        return _json_dumps(normalized)
+
+    parsed = _parse_json(provided_structure_json or "")
+    if parsed is None:
         return "{}"
 
-    normalized = _normalize_flowchart_structure(provided_structure_json or "{}", title, content_text)
-    return _json_dumps(normalized)
+    return _json_dumps(parsed)
 
 
 def _ensure_default_columns(session: Session, current_user: User) -> list[BobarColumn]:
@@ -762,6 +1102,21 @@ def bobar_update_card(
         _reindex_cards_for_column(session, current_user, card.column_id)
 
     return _build_board(session, current_user)
+
+
+
+
+@router.post("/imports/{import_card_id}/cleanup-duplicates", response_model=BobarBoardOut)
+def bobar_cleanup_import_duplicates(
+    import_card_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    import_card = _get_card_or_404(session, current_user, import_card_id)
+    if not _is_authority_import_source_kind(import_card.source_kind):
+        raise HTTPException(status_code=400, detail="Esse card não é um roteiro importado.")
+
+    return _cleanup_duplicate_workspace_for_import(session, current_user, import_card)
 
 
 @router.post("/cards/{card_id}/move", response_model=BobarBoardOut)

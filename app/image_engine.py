@@ -6,25 +6,31 @@ import io
 import json
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from PIL import Image, ImageOps, ImageChops, UnidentifiedImageError
 
 from .image_local_edit import (
+    analyze_all_regions_with_openai,
     analyze_region_with_openai,
     build_mask_from_analysis,
     extract_edit_instruction_info,
+    render_all_local_text_replacements,
     render_local_text_fallback,
     should_use_local_text_render,
     should_use_localized_edit,
 )
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from sqlmodel import Session, select
+
+from .db import get_session
 from .deps import get_current_user
-from .models import User
+from .models import ImageEngineProject, User
 
 
 router = APIRouter()
@@ -58,6 +64,143 @@ class ImageEditRequest(BaseModel):
     instrucoes_edicao: str = ""
     width: Optional[int] = Field(default=None, description="Largura final customizada em pixels")
     height: Optional[int] = Field(default=None, description="Altura final customizada em pixels")
+
+
+
+
+
+class ImageEngineProjectPayload(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    position: int = Field(default=0, ge=0)
+    is_current: bool = False
+    snapshot: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ImageEngineProjectOut(BaseModel):
+    id: str
+    name: str
+    position: int
+    is_current: bool
+    snapshot: Dict[str, Any]
+    updated_at: str
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _load_snapshot_json(raw_value: Optional[str]) -> Dict[str, Any]:
+    if not raw_value:
+        return {}
+    try:
+        data = json.loads(raw_value)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _serialize_image_project(project: ImageEngineProject) -> ImageEngineProjectOut:
+    return ImageEngineProjectOut(
+        id=project.public_id,
+        name=project.name,
+        position=project.position,
+        is_current=project.is_current,
+        snapshot=_load_snapshot_json(project.snapshot_json),
+        updated_at=project.updated_at.isoformat() if project.updated_at else _utcnow().isoformat(),
+    )
+
+
+def _get_user_image_project_or_404(
+    session: Session,
+    user_id: int,
+    public_id: str,
+) -> ImageEngineProject:
+    project = session.exec(
+        select(ImageEngineProject).where(
+            ImageEngineProject.user_id == user_id,
+            ImageEngineProject.public_id == public_id,
+        )
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Projeto não encontrado.")
+    return project
+
+
+@router.get("/api/image-engine/projects")
+def list_image_engine_projects(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    projects = session.exec(
+        select(ImageEngineProject)
+        .where(ImageEngineProject.user_id == current_user.id)
+        .order_by(ImageEngineProject.position.asc(), ImageEngineProject.updated_at.desc())
+    ).all()
+    return {"projects": [_serialize_image_project(project).model_dump() for project in projects]}
+
+
+@router.post("/api/image-engine/projects")
+def create_image_engine_project(
+    payload: ImageEngineProjectPayload,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    now = _utcnow()
+
+    if payload.is_current:
+        current_projects = session.exec(
+            select(ImageEngineProject).where(ImageEngineProject.user_id == current_user.id)
+        ).all()
+        for item in current_projects:
+            item.is_current = False
+            item.updated_at = now
+            session.add(item)
+
+    project = ImageEngineProject(
+        user_id=current_user.id,
+        public_id=f"image-project-{os.urandom(8).hex()}",
+        name=payload.name.strip(),
+        position=payload.position,
+        snapshot_json=json.dumps(payload.snapshot or {}, ensure_ascii=False),
+        is_current=payload.is_current,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(project)
+    session.commit()
+    session.refresh(project)
+    return {"project": _serialize_image_project(project).model_dump()}
+
+
+@router.put("/api/image-engine/projects/{public_id}")
+def update_image_engine_project(
+    public_id: str,
+    payload: ImageEngineProjectPayload,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    now = _utcnow()
+    project = _get_user_image_project_or_404(session, current_user.id, public_id)
+
+    if payload.is_current:
+        current_projects = session.exec(
+            select(ImageEngineProject).where(ImageEngineProject.user_id == current_user.id)
+        ).all()
+        for item in current_projects:
+            item.is_current = False
+            item.updated_at = now
+            session.add(item)
+
+    project.name = payload.name.strip()
+    project.position = payload.position
+    project.snapshot_json = json.dumps(payload.snapshot or {}, ensure_ascii=False)
+    project.is_current = payload.is_current
+    project.updated_at = now
+
+    session.add(project)
+    session.commit()
+    session.refresh(project)
+    return {"project": _serialize_image_project(project).model_dump()}
 
 
 
@@ -1168,7 +1311,72 @@ def _build_localized_prompt_appendix(
     instruction_info: Optional[Dict[str, Any]] = None,
 ) -> str:
     if not localized_analysis:
-            return "\n".join(lines)
+        return ""
+
+    lines = []
+    target = localized_analysis.get("target_text") or ""
+    replacement = localized_analysis.get("replacement_text") or ""
+    operation = localized_analysis.get("operation") or "text_replace"
+    confidence = float(localized_analysis.get("confidence", 0.0) or 0.0)
+    bbox = localized_analysis.get("bbox")
+    text_bbox = localized_analysis.get("text_bbox")
+    container_bbox = localized_analysis.get("container_bbox")
+
+    lines.append("\n\n--- INSTRUÇÃO LOCALIZADA DE EDIÇÃO ---")
+
+    if target and replacement:
+        lines.append(f"Substitua o texto \"{target}\" por \"{replacement}\".")
+
+    if operation == "button_text_replace":
+        lines.append("Este texto está dentro de um botão, badge ou chip. Preserve a forma, cor e bordas do elemento container.")
+
+    region = text_bbox or bbox or container_bbox
+    if region:
+        x = region.get("x", 0)
+        y = region.get("y", 0)
+        w = region.get("w", 0)
+        h = region.get("h", 0)
+        lines.append(
+            f"Região alvo (coordenadas normalizadas): x={x:.4f}, y={y:.4f}, largura={w:.4f}, altura={h:.4f}. "
+            "Edite somente essa região. Preserve absolutamente tudo o que está fora dela."
+        )
+
+    if container_bbox and operation == "button_text_replace":
+        cx = container_bbox.get("x", 0)
+        cy = container_bbox.get("y", 0)
+        cw = container_bbox.get("w", 0)
+        ch = container_bbox.get("h", 0)
+        lines.append(
+            f"Container do botão (coordenadas normalizadas): x={cx:.4f}, y={cy:.4f}, largura={cw:.4f}, altura={ch:.4f}. "
+            "Recrie o botão com o novo texto mantendo exatamente a mesma aparência visual."
+        )
+
+    style = localized_analysis.get("style") or {}
+    style_notes = []
+    if style.get("text_color"):
+        style_notes.append(f"cor do texto: {style['text_color']}")
+    if style.get("background_color"):
+        style_notes.append(f"cor de fundo: {style['background_color']}")
+    if style.get("font_weight"):
+        style_notes.append(f"peso da fonte: {style['font_weight']}")
+    if style.get("alignment"):
+        style_notes.append(f"alinhamento: {style['alignment']}")
+    if style.get("shadow"):
+        style_notes.append("com sombra")
+    if style.get("glow"):
+        style_notes.append("com brilho/glow")
+    if style_notes:
+        lines.append("Estilo visual a manter: " + ", ".join(style_notes) + ".")
+
+    if confidence >= 0.75:
+        lines.append("Nível de confiança na localização: alto. Aplique a edição com precisão cirúrgica.")
+    elif confidence >= 0.55:
+        lines.append("Nível de confiança na localização: médio. Aplique a edição com cuidado redobrado na preservação do entorno.")
+    else:
+        lines.append("Nível de confiança na localização: baixo. Seja conservador — edite apenas o mínimo necessário e preserve tudo ao redor.")
+
+    lines.append("--- FIM DA INSTRUÇÃO LOCALIZADA ---")
+    return "\n".join(lines)
 
 
 def _build_edit_attempt_plan(
@@ -1525,35 +1733,67 @@ async def image_engine_edit_stream(
                 })
 
                 instruction_info = extract_edit_instruction_info(body.instrucoes_edicao)
+                is_multi_replace = instruction_info.get("is_multi_replace", False)
+                is_pure_text_edit = instruction_info.get("is_pure_text_edit", False)
+
                 localized_analysis = None
+                all_localized_analyses: List[Dict[str, Any]] = []
                 localized_mask = None
                 localized_mode = False
                 localized_warning = None
 
                 try:
-                    localized_analysis = await analyze_region_with_openai(
-                        client=client,
-                        image_bytes=image_bytes,
-                        content_type=image_content_type,
-                        instruction=body.instrucoes_edicao,
-                        model=OPENAI_CHAT_MODEL,
-                        api_key=openai_key,
-                    )
-                    if should_use_localized_edit(localized_analysis):
-                        localized_mask = build_mask_from_analysis(image_bytes, localized_analysis)
-                        localized_mode = localized_mask is not None
+                    if is_multi_replace and is_pure_text_edit:
+                        # Multiple text swaps: detect each region in parallel
+                        all_localized_analyses = await analyze_all_regions_with_openai(
+                            client=client,
+                            image_bytes=image_bytes,
+                            content_type=image_content_type,
+                            instruction_info=instruction_info,
+                            model=OPENAI_CHAT_MODEL,
+                            api_key=openai_key,
+                        )
+                        # Use the first valid analysis as the primary for mask/compat
+                        localized_analysis = all_localized_analyses[0] if all_localized_analyses else None
+                        localized_mode = False  # multi-replace uses sequential local render, not masked OpenAI
+                    else:
+                        localized_analysis = await analyze_region_with_openai(
+                            client=client,
+                            image_bytes=image_bytes,
+                            content_type=image_content_type,
+                            instruction=body.instrucoes_edicao,
+                            model=OPENAI_CHAT_MODEL,
+                            api_key=openai_key,
+                        )
+                        all_localized_analyses = [localized_analysis] if localized_analysis else []
+                        if should_use_localized_edit(localized_analysis):
+                            localized_mask = build_mask_from_analysis(image_bytes, localized_analysis)
+                            localized_mode = localized_mask is not None
                 except Exception as region_exc:
                     localized_warning = f"Falha na detecção localizada. Seguindo com edição conservadora. Detalhe: {str(region_exc)}"
+
+                # For multi-replace, always use local render if we have all analyses
+                all_localizable = (
+                    is_multi_replace
+                    and is_pure_text_edit
+                    and len(all_localized_analyses) == len(instruction_info.get("all_replacements", []))
+                    and all(should_use_local_text_render(a, {"is_pure_text_edit": True}) for a in all_localized_analyses)
+                )
 
                 attempt_plan = _build_edit_attempt_plan(
                     instruction_info=instruction_info,
                     localized_analysis=localized_analysis,
                     localized_mode=localized_mode,
-                )
+                ) if not all_localizable else {
+                    "use_local_render_first": True,
+                    "call_openai_edit": False,
+                    "reason": "multi_text_replace_deterministic",
+                }
 
                 if attempt_plan["use_local_render_first"]:
+                    n = len(all_localized_analyses)
                     yield _sse({
-                        "status": "Texto identificado com boa confiança. Aplicando edição local determinística para evitar corte, reconstrução indevida e perda de layout.",
+                        "status": f"{'Múltiplas substituições' if is_multi_replace else 'Texto'} identificado{'s' if is_multi_replace else ''} com boa confiança. Aplicando {n} edição{'ões' if n > 1 else ''} local{'is' if n > 1 else ''} determinística{'s' if n > 1 else ''} preservando 100% do layout.",
                         "progress": 62,
                         "localized_analysis": localized_analysis,
                         "localized_mode": localized_mode,
@@ -1580,8 +1820,24 @@ async def image_engine_edit_stream(
                     })
 
                 result = None
-                if attempt_plan["use_local_render_first"]:
-                    local_bytes = render_local_text_fallback(image_bytes=image_bytes, analysis=localized_analysis or {})
+
+                # --- Multi-replace: apply all replacements sequentially ---
+                if all_localizable:
+                    local_bytes = render_all_local_text_replacements(
+                        image_bytes=image_bytes,
+                        analyses=all_localized_analyses,
+                    )
+                    if local_bytes:
+                        result = {
+                            "engine_id": "local_structured_edit",
+                            "motor": "Edição Local Estruturada (múltipla)",
+                            "url": _data_uri_from_b64(base64.b64encode(local_bytes).decode("utf-8"), "image/png"),
+                            "raw": {"strategy": attempt_plan["reason"], "replacements_count": len(all_localized_analyses)},
+                        }
+
+                # --- Single-replace local render ---
+                if result is None and attempt_plan["use_local_render_first"] and localized_analysis:
+                    local_bytes = render_local_text_fallback(image_bytes=image_bytes, analysis=localized_analysis)
                     if local_bytes:
                         result = {
                             "engine_id": "local_structured_edit",
@@ -1590,6 +1846,7 @@ async def image_engine_edit_stream(
                             "raw": {"strategy": attempt_plan["reason"]},
                         }
 
+                # --- Fallback: GPT Image 1.5 edit (full image) ---
                 if result is None:
                     final_prompt_for_edit = final_prompt + _build_localized_prompt_appendix(localized_analysis, instruction_info)
                     try:
@@ -1607,8 +1864,10 @@ async def image_engine_edit_stream(
                             input_fidelity="high",
                         )
                     except Exception as edit_exc:
-                        if localized_analysis:
-                            fallback_bytes = render_local_text_fallback(image_bytes=image_bytes, analysis=localized_analysis or {})
+                        if all_localized_analyses:
+                            fallback_bytes = render_all_local_text_replacements(image_bytes=image_bytes, analyses=all_localized_analyses)
+                            if not fallback_bytes and localized_analysis:
+                                fallback_bytes = render_local_text_fallback(image_bytes=image_bytes, analysis=localized_analysis)
                             if fallback_bytes:
                                 result = {
                                     "engine_id": "local_structured_edit",

@@ -277,6 +277,16 @@ def _get_robot_or_404(public_id: str, session: Session, current_user: User) -> R
         raise HTTPException(status_code=404, detail="Assistente não encontrado ou não tem permissão para aceder.")
     return robot
 
+def _normalize_chat_message_content(role: str, content: str) -> str:
+    if role != "assistant":
+        return content
+    try:
+        from .ai import _unwrap_simple_json_answer
+        normalized = _unwrap_simple_json_answer(content)
+        return normalized or content
+    except Exception:
+        return content
+
 
 @app.get("/api/robots", response_model=list[RobotOut])
 def list_robots(session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
@@ -421,7 +431,12 @@ def list_messages(public_id: str, session: Session = Depends(get_session), curre
         .order_by(ChatMessage.created_at.asc())
     ).all()
     return [
-        ChatMessageOut(id=m.id, role=m.role, content=m.content, created_at=m.created_at.isoformat())
+        ChatMessageOut(
+            id=m.id,
+            role=m.role,
+            content=_normalize_chat_message_content(m.role, m.content),
+            created_at=m.created_at.isoformat(),
+        )
         for m in msgs
     ]
 
@@ -566,7 +581,12 @@ def update_message(public_id: str, message_id: int, body: MessageUpdateIn, sessi
     session.add(msg)
     session.commit()
     session.refresh(msg)
-    return ChatMessageOut(id=msg.id, role=msg.role, content=msg.content, created_at=msg.created_at.isoformat())
+    return ChatMessageOut(
+        id=msg.id,
+        role=msg.role,
+        content=_normalize_chat_message_content(msg.role, msg.content),
+        created_at=msg.created_at.isoformat(),
+    )
 
 
 @app.post("/api/robots/{public_id}/audio", response_model=ChatMessageOut)
@@ -603,7 +623,7 @@ async def chat_audio(public_id: str, file: UploadFile = File(...), session: Sess
     return ChatMessageOut(
         id=assistant_msg.id,
         role=assistant_msg.role,
-        content=assistant_msg.content,
+        content=_normalize_chat_message_content(assistant_msg.role, assistant_msg.content),
         created_at=assistant_msg.created_at.isoformat(),
     )
 
@@ -643,7 +663,7 @@ def chat(public_id: str, body: ChatIn, session: Session = Depends(get_session), 
     return ChatMessageOut(
         id=assistant_msg.id,
         role=assistant_msg.role,
-        content=assistant_msg.content,
+        content=_normalize_chat_message_content(assistant_msg.role, assistant_msg.content),
         created_at=assistant_msg.created_at.isoformat(),
     )
 

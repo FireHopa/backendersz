@@ -116,6 +116,60 @@ def _loads_json_object(text: str) -> JsonDict:
 def _json_dumps(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False)
 
+def _unwrap_simple_json_answer(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    candidates = [raw]
+    cleaned = _strip_fenced_json(raw)
+    if cleaned != raw:
+        candidates.append(cleaned)
+
+    try:
+        parsed_top_level = json.loads(cleaned)
+    except Exception:
+        parsed_top_level = None
+
+    if isinstance(parsed_top_level, str):
+        decoded_string = parsed_top_level.strip()
+        if decoded_string:
+            candidates.append(decoded_string)
+
+    preferred_keys = ("resposta", "answer", "content", "mensagem", "texto", "reply")
+
+    for candidate in candidates:
+        current = (candidate or "").strip()
+        if not current:
+            continue
+        if not current.startswith("{"):
+            return current
+
+        try:
+            data = json.loads(current)
+        except Exception:
+            continue
+
+        if isinstance(data, str):
+            nested = data.strip()
+            if nested:
+                candidates.append(nested)
+            continue
+
+        if not isinstance(data, dict):
+            continue
+
+        for key in preferred_keys:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        scalar_values = [value.strip() for value in data.values() if isinstance(value, str) and value.strip()]
+        if len(scalar_values) == 1:
+            return scalar_values[0]
+
+    return raw
+
 
 def _normalize_history(
     history: Optional[List[Dict[str, Any]]],
@@ -381,13 +435,14 @@ def chat_with_robot(
         + "- Se a fonte não bastar, seja transparente sobre a limitação.\n"
     )
 
-    return _call_chat_text(
+    raw_answer = _call_chat_text(
         system=sys_msg,
         user=user_message,
         extra_messages=extra_messages,
         temperature=0.6,
         max_tokens=DEFAULT_CHAT_MAX_TOKENS,
     ).strip()
+    return _unwrap_simple_json_answer(raw_answer)
 
 
 def _mime_from_filename(filename: str) -> str:
